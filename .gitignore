@@ -2,6 +2,7 @@
 .venv/
 venv/
 env/
+ENV/
 
 # Python cache
 __pycache__/
@@ -9,25 +10,30 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
+*.egg-info/
+dist/
+build/
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*.sublime-*
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Large data files (keep only directories)
-osm_data/
-RAW\ DATA/
-cache/
+# Large binary files
 *.pbf
-
-# Large shapefiles
 *.shp
 *.shx
 *.dbf
 *.prj
+
+# Data directories (keep CSV/JSON in processed/)
+osm_data/
+RAW\ DATA/
+cache/
+india_boundary/
