@@ -1,0 +1,36 @@
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large data files
+osm_data/
+RAW DATA/
+cache/
+*.pbf
+*.csv
+*.shp
+*.shx
+*.dbf
+*.prj
+
+# Output
+processed/*.csv
+processed/*.gpkg
