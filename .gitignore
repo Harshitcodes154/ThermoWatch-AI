@@ -20,17 +20,14 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Large data files
+# Large data files (keep only directories)
 osm_data/
-RAW DATA/
+RAW\ DATA/
 cache/
 *.pbf
-*.csv
+
+# Large shapefiles
 *.shp
 *.shx
 *.dbf
 *.prj
-
-# Output
-processed/*.csv
-processed/*.gpkg
