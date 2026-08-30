@@ -1,45 +1,61 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+
+# =========================
 # Virtual Environment
+# =========================
 .venv/
 venv/
 env/
-ENV/
 
-# Python cache
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-*.egg-info/
-dist/
-build/
+# =========================
+# Environment / Secrets
+# =========================
+.env
+.env.*
 
+# =========================
 # IDE
+# =========================
 .vscode/
 .idea/
-*.swp
-*.swo
-*.sublime-*
 
-# OS
-.DS_Store
-Thumbs.db
+# =========================
+# Large OSM Data
+# =========================
+osm_data/*.osm.pbf
 
-# Large binary files
-*.pbf
-*.shp
-*.shx
-*.dbf
-*.prj
+# =========================
+# Raw Satellite Data
+# =========================
+RAW DATA/
 
-# Large data files (>50MB)
-*.csv
-*.joblib
+# =========================
+# Generated Processed Data
+# =========================
+processed/*.csv
+processed/*.joblib
+processed/*.pkl
 
-# Data directories (keep CSV/JSON in processed/)
-osm_data/
-RAW\ DATA/
-cache/
-india_boundary/
-processed/
-models/
+# =========================
+# Model Files
+# =========================
+models/*.joblib
+models/*.pkl
+models/*.pickle
+
+# =========================
+# Python Cache
+# =========================
+*.pyc
+.pytest_cache/
+
+# =========================
+# Temporary
+# =========================
+*.log
+*.tmp
+*.temp
