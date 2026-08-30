@@ -1,8 +1,6 @@
 
-from email.utils import formatdate
-import tempfile
-
 import streamlit as st
+import tempfile
 import pandas as pd
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
@@ -20,6 +18,33 @@ from folium.plugins import HeatMap, MarkerCluster
 # IMPORTANT: Dynamic UI uses Streamlit native components.
 # This prevents HTML source from appearing on the page.
 # ============================================================
+def format_age(value):
+    if value is None:
+        return "Unknown"
+
+    try:
+        ts = pd.to_datetime(value, errors="coerce")
+
+        if pd.isna(ts):
+            return "Unknown"
+
+        if ts.tzinfo is not None:
+            ts = ts.tz_localize(None)
+
+        now = pd.Timestamp.now()
+        seconds = max(0, int((now - ts).total_seconds()))
+
+        if seconds < 60:
+            return f"{seconds}s ago"
+        elif seconds < 3600:
+            return f"{seconds // 60}m ago"
+        elif seconds < 86400:
+            return f"{seconds // 3600}h ago"
+        else:
+            return f"{seconds // 86400}d ago"
+
+    except Exception:
+        return "Unknown"
 
 st.set_page_config(
     page_title="ThermoWatch AI",
@@ -378,20 +403,23 @@ def load_data():
         df["attribution_quality"].fillna("UNCONFIRMED").astype(str).str.upper()
     )
 
-    # Compute decision-support columns
-    df["priority_score"] = df.apply(priority_score, axis=1)
-    df["investigation_priority"] = df["priority_score"].apply(investigation_priority)
-
     df = df[
         df["latitude"].between(6, 38)
         & df["longitude"].between(68, 98)
     ].copy()
 
-    df = df.sort_values(
-        ["priority_score", "live_risk_score", "frp"],
-        ascending=[False, False, False],
-        na_position="last"
-    ).reset_index(drop=True)
+    # Build derived decision-support fields before sorting.
+    # This also supports older CSV files that do not contain them.
+    df["priority_score"] = df.apply(priority_score, axis=1).astype(float)
+    df["investigation_priority"] = df["priority_score"].apply(investigation_priority)
+
+    sort_cols = [c for c in ["priority_score", "live_risk_score", "frp"] if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(
+            by=sort_cols,
+            ascending=[False] * len(sort_cols),
+            na_position="last"
+        ).reset_index(drop=True)
 
     return df, path
 
@@ -480,7 +508,7 @@ def build_incident_report(row):
         ["Latitude", f"{num(row, 'latitude'):.5f}°"],
         ["Longitude", f"{num(row, 'longitude'):.5f}°"],
         ["Observed At", format_observed(row.get("observed_at"))],
-        ["Data Age", formatdate(row.get("observed_at"))],
+        ["Data Age", format_age(row.get("observed_at"))],
         ["FRP", f"{num(row, 'frp'):.2f} MW"],
     ]
     t = Table(observation, colWidths=[125, 350])
@@ -1028,14 +1056,19 @@ if not filtered.empty:
 st.markdown("### 📄 INCIDENT REPORT")
 
 if not filtered.empty:
+    def report_label(i):
+        row = filtered.loc[i]
+        pscore = num(row, "priority_score", 0.0)
+        return (
+            f"{clean_text(row.get('hotspot_id'), 'UNKNOWN')} · "
+            f"{clean_text(row.get('live_risk_category'), 'LOW')} · "
+            f"{pscore:.1f}"
+        )
+
     report_index = st.selectbox(
         "Report hotspot",
         filtered.index.tolist(),
-        format_func=lambda i: (
-            f"{clean_text(filtered.loc[i, 'hotspot_id'])} · "
-            f"{clean_text(filtered.loc[i, 'live_risk_category'])} · "
-            f"{num(filtered.loc[i, 'priority_score']):.1f}"
-        ),
+        format_func=report_label,
         key="incident_report_hotspot"
     )
 
