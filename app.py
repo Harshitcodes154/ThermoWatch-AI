@@ -35,8 +35,7 @@ HF_MODEL_URL = (
 )
 
 HF_OSM_URL = (
-    "https://huggingface.co/harshitcodes1544/"
-    "/thermowatch-osm-data/osm_facilities.csv"
+    "https://huggingface.co/datasets/harshitcodes1544/thermowatch-osm-data/resolve/main/osm_facilities.csv"
 )
 
 
