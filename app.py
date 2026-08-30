@@ -30,8 +30,7 @@ st.set_page_config(
 # ------------------------------------------------------------
 
 HF_MODEL_URL = (
-    "https://huggingface.co/harshitcodes1544/"
-    "sihharshit154/source_classifier_v5.joblib"
+    "https://huggingface.co/harshitcodes1544/sihharshit154/resolve/main/source_classifier_v5.joblib"
 )
 
 HF_OSM_URL = (
