@@ -179,6 +179,70 @@ def risk_color(category):
 def risk_class(category):
     return clean_text(category, "LOW").lower()
 
+def priority_score(row):
+    """Decision-support score combining model risk, FRP, proximity and confidence."""
+    risk = np.clip(num(row, "live_risk_score"), 0, 100)
+    frp = max(num(row, "frp"), 0)
+    confidence = np.clip(num(row, "confidence"), 0, 100)
+
+    distance = num(row, "distance_to_facility_km", 999)
+    proximity = 100 * np.exp(-max(distance, 0) / 2.0)
+    frp_component = min(frp / 30.0, 1.0) * 100
+
+    score = (
+        0.50 * risk
+        + 0.20 * frp_component
+        + 0.20 * proximity
+        + 0.10 * confidence
+    )
+    return round(float(np.clip(score, 0, 100)), 1)
+
+def investigation_priority(score):
+    if score >= 80:
+        return "P1 · INVESTIGATE IMMEDIATELY"
+    if score >= 65:
+        return "P2 · PRIORITY REVIEW"
+    if score >= 45:
+        return "P3 · REVIEW"
+    return "P4 · MONITOR"
+
+def explain_risk(row):
+    reasons = []
+
+    risk = num(row, "live_risk_score")
+    frp = num(row, "frp")
+    conf = num(row, "confidence")
+    distance = num(row, "distance_to_facility_km", 999)
+    quality = clean_text(row.get("attribution_quality"), "UNCONFIRMED").upper()
+
+    if risk >= 75:
+        reasons.append("high model risk score")
+    elif risk >= 55:
+        reasons.append("elevated model risk score")
+
+    if frp >= 10:
+        reasons.append("high FRP")
+    elif frp >= 5:
+        reasons.append("elevated FRP")
+
+    if distance <= 0.5:
+        reasons.append("very close to mapped facility")
+    elif distance <= 2:
+        reasons.append("close to mapped facility")
+
+    if quality == "STRONG":
+        reasons.append("strong facility attribution")
+    elif quality == "MODERATE":
+        reasons.append("moderate facility attribution")
+
+    if conf >= 80:
+        reasons.append("high AI confidence")
+
+    if not reasons:
+        reasons.append("limited supporting evidence; continue monitoring")
+
+    return " + ".join(reasons).capitalize() + "."
+
 def format_observed(value):
     if value is None or str(value).strip() == "":
         return "Unavailable"
@@ -307,14 +371,19 @@ def load_data():
         df["attribution_quality"].fillna("UNCONFIRMED").astype(str).str.upper()
     )
 
+    # Compute decision-support columns
+    df["priority_score"] = df.apply(priority_score, axis=1)
+    df["investigation_priority"] = df["priority_score"].apply(investigation_priority)
+
     df = df[
         df["latitude"].between(6, 38)
         & df["longitude"].between(68, 98)
     ].copy()
 
     df = df.sort_values(
-        ["live_risk_score", "frp"],
-        ascending=[False, False]
+        ["priority_score", "live_risk_score", "frp"],
+        ascending=[False, False, False],
+        na_position="last"
     ).reset_index(drop=True)
 
     return df, path
@@ -501,6 +570,7 @@ with left:
         for _, row in alert_df.iterrows():
             risk = clean_text(row["live_risk_category"], "LOW").upper()
             score = num(row, "live_risk_score")
+            pscore = num(row, "priority_score")
             frp = num(row, "frp")
             facility = clean_text(row["facility_display"], "Unidentified Facility")
             source = clean_text(row["predicted_source"], "UNKNOWN")
@@ -517,6 +587,7 @@ with left:
                     )
                 st.caption(hotspot)
                 st.caption(f"FRP {frp:.2f} MW · {source}")
+                st.caption(f"Priority {pscore:.1f} · {clean_text(row['investigation_priority'])}")
 
 # ============================================================
 # INDIA THERMAL MAP
@@ -717,6 +788,20 @@ with right:
                 f"### {risk_score:.1f}/100 · {risk}"
             )
 
+            pscore = num(selected, "priority_score")
+            priority = clean_text(
+                selected["investigation_priority"],
+                "P4 · MONITOR"
+            )
+
+            st.caption("SMART INVESTIGATION PRIORITY")
+            st.markdown(f"**{priority}**")
+            st.progress(min(max(pscore / 100, 0), 1))
+            st.write(f"Decision-support score: **{pscore:.1f}/100**")
+
+            st.caption("WHY THIS RISK LEVEL?")
+            st.write(explain_risk(selected))
+
             st.caption("SOURCE STATEMENT")
             st.write(statement)
 
@@ -745,6 +830,8 @@ table_cols = [
     "attribution_quality",
     "live_risk_score",
     "live_risk_category",
+    "priority_score",
+    "investigation_priority",
 ]
 
 table = filtered[table_cols].copy()
@@ -761,6 +848,8 @@ table = table.rename(columns={
     "attribution_quality": "Attribution",
     "live_risk_score": "Risk Score",
     "live_risk_category": "Risk",
+    "priority_score": "Priority Score",
+    "investigation_priority": "Investigation Priority",
 })
 
 if not table.empty:
@@ -770,6 +859,7 @@ if not table.empty:
     table["FRP (MW)"] = table["FRP (MW)"].round(2)
     table["Confidence %"] = table["Confidence %"].round(1)
     table["Risk Score"] = table["Risk Score"].round(1)
+    table["Priority Score"] = table["Priority Score"].round(1)
 
 st.dataframe(
     table,
@@ -793,6 +883,27 @@ with c1:
     )
 
 # ============================================================
+# AI DECISION SUPPORT
+# ============================================================
+
+st.markdown("### 🧠 AI DECISION SUPPORT")
+st.caption("RISK IS A PRIORITIZATION SIGNAL — NOT A CONFIRMED INCIDENT DIAGNOSIS")
+
+if not filtered.empty:
+    top = filtered.iloc[0]
+    top_priority = clean_text(top["investigation_priority"])
+    top_facility = clean_text(top["facility_display"])
+    top_hotspot = clean_text(top["hotspot_id"])
+    top_pscore = num(top, "priority_score")
+
+    st.info(
+        f"{top_priority} · {top_hotspot} · {top_facility} · "
+        f"Priority score {top_pscore:.1f}/100. "
+        f"{explain_risk(top)}",
+        icon="🧠"
+    )
+
+# ============================================================
 # OPERATIONAL SUMMARY
 # ============================================================
 
@@ -809,8 +920,8 @@ if not filtered.empty:
         )
 
     with op3:
-        strong = int((filtered["attribution_quality"] == "STRONG").sum())
-        st.metric("STRONG ATTRIBUTIONS", f"{strong:,}")
+        p1 = int((filtered["investigation_priority"] == "P1 · INVESTIGATE IMMEDIATELY").sum())
+        st.metric("P1 INVESTIGATIONS", f"{p1:,}")
 
     with op4:
         observed_dt = pd.to_datetime(
