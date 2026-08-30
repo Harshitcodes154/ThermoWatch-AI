@@ -1,6 +1,13 @@
 
+from email.utils import formatdate
+import tempfile
+
 import streamlit as st
 import pandas as pd
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 import numpy as np
 import folium
 from pathlib import Path
@@ -421,6 +428,117 @@ if auto_refresh:
         '<meta http-equiv="refresh" content="60">',
         unsafe_allow_html=True
     )
+
+# ============================================================
+# INCIDENT REPORT GENERATOR
+# ============================================================
+
+def build_incident_report(row):
+    """Create a concise ThermoWatch PDF incident-priority report."""
+    safe_id = clean_text(row.get("hotspot_id"), "UNKNOWN")
+    filename = f"ThermoWatch_{safe_id}_incident_report.pdf"
+    path = Path(tempfile.gettempdir()) / filename
+
+    styles = getSampleStyleSheet()
+    title = ParagraphStyle(
+        "TWTitle", parent=styles["Title"], fontSize=18, leading=22, spaceAfter=12
+    )
+    sub = ParagraphStyle(
+        "TWSub", parent=styles["Normal"], fontSize=9, textColor=colors.grey
+    )
+    heading = ParagraphStyle(
+        "TWHeading", parent=styles["Heading2"], fontSize=11, leading=14, spaceBefore=10
+    )
+    body = ParagraphStyle(
+        "TWBody", parent=styles["Normal"], fontSize=9, leading=13
+    )
+
+    risk = clean_text(row.get("live_risk_category"), "LOW")
+    source = clean_text(row.get("predicted_source"), "UNKNOWN")
+    facility = clean_text(row.get("facility_display"), "Unidentified Facility")
+    priority = clean_text(row.get("investigation_priority"), "P4 · MONITOR")
+    statement = clean_text(row.get("source_statement"), "No source statement available.")
+    why = explain_risk(row)
+
+    story = [
+        Paragraph("THERMOWATCH", title),
+        Paragraph("AI-ASSISTED THERMAL HOTSPOT INCIDENT REPORT", sub),
+        Spacer(1, 12),
+        Paragraph("EXECUTIVE ASSESSMENT", heading),
+        Paragraph(
+            f"<b>{priority}</b><br/>"
+            f"Risk: <b>{risk}</b> · Risk Score: <b>{num(row, 'live_risk_score'):.1f}/100</b><br/>"
+            f"Decision-support score: <b>{num(row, 'priority_score'):.1f}/100</b>",
+            body,
+        ),
+        Spacer(1, 8),
+        Paragraph("HOTSPOT & OBSERVATION", heading),
+    ]
+
+    observation = [
+        ["Hotspot ID", safe_id],
+        ["Latitude", f"{num(row, 'latitude'):.5f}°"],
+        ["Longitude", f"{num(row, 'longitude'):.5f}°"],
+        ["Observed At", format_observed(row.get("observed_at"))],
+        ["Data Age", formatdate(row.get("observed_at"))],
+        ["FRP", f"{num(row, 'frp'):.2f} MW"],
+    ]
+    t = Table(observation, colWidths=[125, 350])
+    t.setStyle(TableStyle([
+        ("GRID", (0,0), (-1,-1), 0.35, colors.lightgrey),
+        ("BACKGROUND", (0,0), (0,-1), colors.whitesmoke),
+        ("FONTNAME", (0,0), (0,-1), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,-1), 8.5),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("LEFTPADDING", (0,0), (-1,-1), 6),
+        ("RIGHTPADDING", (0,0), (-1,-1), 6),
+        ("TOPPADDING", (0,0), (-1,-1), 5),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+    ]))
+    story += [t, Paragraph("AI ATTRIBUTION", heading)]
+
+    attribution = [
+        ["Predicted Source", source],
+        ["AI Confidence", f"{num(row, 'confidence'):.1f}%"],
+        ["Confidence Level", clean_text(row.get("confidence_level"), "UNKNOWN")],
+        ["Attribution Quality", clean_text(row.get("attribution_quality"), "UNCONFIRMED")],
+        ["Nearest Facility", facility],
+        ["Distance to Facility", f"{num(row, 'distance_to_facility_km', 0):.3f} km"],
+    ]
+    t2 = Table(attribution, colWidths=[125, 350])
+    t2.setStyle(TableStyle([
+        ("GRID", (0,0), (-1,-1), 0.35, colors.lightgrey),
+        ("BACKGROUND", (0,0), (0,-1), colors.whitesmoke),
+        ("FONTNAME", (0,0), (0,-1), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,-1), 8.5),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("LEFTPADDING", (0,0), (-1,-1), 6),
+        ("RIGHTPADDING", (0,0), (-1,-1), 6),
+        ("TOPPADDING", (0,0), (-1,-1), 5),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+    ]))
+    story += [
+        t2,
+        Paragraph("RISK EXPLANATION", heading),
+        Paragraph(why, body),
+        Spacer(1, 6),
+        Paragraph("SOURCE STATEMENT", heading),
+        Paragraph(statement, body),
+        Spacer(1, 12),
+        Paragraph(
+            "IMPORTANT: ThermoWatch risk and attribution are decision-support signals "
+            "derived from satellite observations, facility context and the V5 model. "
+            "They do not independently confirm an active incident or establish causality.",
+            sub,
+        ),
+    ]
+
+    doc = SimpleDocTemplate(
+        str(path), pagesize=A4,
+        rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36
+    )
+    doc.build(story)
+    return path
 
 # ============================================================
 # HEADER
@@ -902,6 +1020,42 @@ if not filtered.empty:
         f"{explain_risk(top)}",
         icon="🧠"
     )
+
+# ============================================================
+# INCIDENT REPORT
+# ============================================================
+
+st.markdown("### 📄 INCIDENT REPORT")
+
+if not filtered.empty:
+    report_index = st.selectbox(
+        "Report hotspot",
+        filtered.index.tolist(),
+        format_func=lambda i: (
+            f"{clean_text(filtered.loc[i, 'hotspot_id'])} · "
+            f"{clean_text(filtered.loc[i, 'live_risk_category'])} · "
+            f"{num(filtered.loc[i, 'priority_score']):.1f}"
+        ),
+        key="incident_report_hotspot"
+    )
+
+    report_row = filtered.loc[report_index]
+
+    if st.button("📄 Generate Incident Report", use_container_width=True):
+        try:
+            report_path = build_incident_report(report_row)
+            with open(report_path, "rb") as fh:
+                st.download_button(
+                    "⬇️ Download PDF Report",
+                    data=fh.read(),
+                    file_name=report_path.name,
+                    mime="application/pdf",
+                    use_container_width=True,
+                    key="download_incident_report"
+                )
+            st.success("Incident report generated successfully.")
+        except Exception as exc:
+            st.error(f"Could not generate report: {exc}")
 
 # ============================================================
 # OPERATIONAL SUMMARY
