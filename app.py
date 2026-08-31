@@ -112,19 +112,41 @@ def get_secret(name):
     except Exception:
         return None
 
-
 @st.cache_resource(show_spinner=False)
 def load_model():
-    response = requests.get(MODEL_URL, timeout=180)
+
+    hf_token = get_secret("HF_TOKEN")
+
+    headers = {}
+
+    if hf_token:
+        headers["Authorization"] = f"Bearer {hf_token}"
+
+    response = requests.get(
+        MODEL_URL,
+        headers=headers,
+        timeout=180
+    )
+
+    if response.status_code == 401:
+        raise RuntimeError(
+            "Hugging Face returned 401 Unauthorized. "
+            "Make the model repository public or add a valid "
+            "HF_TOKEN to Streamlit Secrets."
+        )
+
     response.raise_for_status()
 
     import tempfile
-    with tempfile.NamedTemporaryFile(suffix=".joblib", delete=False) as f:
+
+    with tempfile.NamedTemporaryFile(
+        suffix=".joblib",
+        delete=False
+    ) as f:
         f.write(response.content)
-        path = f.name
+        model_path = f.name
 
-    return joblib.load(path)
-
+    return joblib.load(model_path)
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_osm_facilities():
