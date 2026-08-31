@@ -1,19 +1,29 @@
 import io
 import os
+import math
 import joblib
+import requests
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
 from sklearn.neighbors import BallTree
+from sklearn.cluster import DBSCAN
+import folium
+from streamlit_folium import st_folium
+
+# PDF Report Generation Libraries
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
 
 # ============================================================
-# THERMO WATCH - LIVE STREAMLIT APPLICATION
-# FIRMS -> OSM FACILITY -> V5 AI -> RISK
+# THERMO WATCH AI - INDUSTRIAL & SATELLITE RISK PLATFORM
+# FIRMS -> DBSCAN -> OSM -> V5 AI -> WEATHER -> ALERTS
 # ============================================================
 
 st.set_page_config(
-    page_title="ThermoWatch AI",
+    page_title="ThermoWatch AI - Threat Intelligence",
     page_icon="🔥",
     layout="wide"
 )
@@ -22,139 +32,107 @@ st.set_page_config(
 # CONFIGURATION
 # ============================================================
 
-HF_MODEL_URL = (
-    "https://huggingface.co/harshitcodes1544/sihharshit154/resolve/main/source_classifier_v5.joblib"
-)
+HF_MODEL_URL = "https://huggingface.co/harshitcodes1544/sihharshit154/resolve/main/source_classifier_v5.joblib"
+HF_OSM_URL = "https://huggingface.co/datasets/harshitcodes1544/thermowatch-osm-data/resolve/main/osm_facilities.csv"
 
-HF_OSM_URL = (
-    "https://huggingface.co/datasets/harshitcodes1544/thermowatch-osm-data/resolve/main/osm_facilities.csv"
-)
-
-# Secure key retrieval without exposing input to the UI
 FIRMS_API_KEY = st.secrets.get("FIRMS_API_KEY", os.environ.get("FIRMS_API_KEY", ""))
-
-# NASA FIRMS VIIRS source
 FIRMS_URL = "https://firms.modaps.eosdis.nasa.gov/api/area/csv/"
-
-# India bounding box: west, south, east, north
 INDIA_BBOX = "68.0,6.0,97.5,37.5"
 
 # ============================================================
-# CACHE MODEL
+# CACHED LOADERS (MODEL & OSM)
 # ============================================================
 
 @st.cache_resource
 def load_model():
     response = requests.get(HF_MODEL_URL, timeout=120, allow_redirects=True)
     response.raise_for_status()
-    model = joblib.load(io.BytesIO(response.content))
-    return model
-
-# ============================================================
-# CACHE OSM FACILITIES
-# ============================================================
+    return joblib.load(io.BytesIO(response.content))
 
 @st.cache_data(ttl=86400)
 def load_osm_facilities():
     response = requests.get(HF_OSM_URL, timeout=180, allow_redirects=True)
     response.raise_for_status()
-    df = pd.read_csv(io.BytesIO(response.content))
-    return df
+    return pd.read_csv(io.BytesIO(response.content))
 
 # ============================================================
-# FETCH LIVE FIRMS (WITH SATELLITE & DAY RANGE FALLBACK)
+# NASA FIRMS INGESTION WITH MULTI-SENSOR FALLBACK
 # ============================================================
 
 @st.cache_data(ttl=1800)
-def fetch_live_firms():
+def fetch_live_firms(day_range=1):
     if not FIRMS_API_KEY:
-        raise RuntimeError("FIRMS_API_KEY is missing from Streamlit Secrets.")
+        raise RuntimeError("FIRMS_API_KEY missing. Add it to Streamlit Secrets.")
 
-    # List of VIIRS satellite products to check in order of priority
-    sources = ["VIIRS_NOAA20_NRT", "VIIRS_SNPP_NRT", "VIIRS_NOAA21_NRT"]
-    day_ranges = [1, 2, 3]  # If today has no fires or satellite lag, look back up to 3 days
-
+    sensors = ["VIIRS_NOAA20_NRT", "VIIRS_SNPP_NRT", "VIIRS_NOAA21_NRT"]
     df = pd.DataFrame()
 
-    for days in day_ranges:
-        for src in sources:
-            url = f"{FIRMS_URL}{FIRMS_API_KEY}/{src}/{INDIA_BBOX}/{days}"
-            try:
-                response = requests.get(url, timeout=120)
-                if response.status_code == 200 and "latitude" in response.text:
-                    temp_df = pd.read_csv(io.StringIO(response.text))
-                    if not temp_df.empty:
-                        df = temp_df
-                        break
-            except Exception:
-                continue
-        if not df.empty:
-            break
+    for sensor in sensors:
+        url = f"{FIRMS_URL}{FIRMS_API_KEY}/{sensor}/{INDIA_BBOX}/{day_range}"
+        try:
+            res = requests.get(url, timeout=120)
+            if res.status_code == 200 and "latitude" in res.text:
+                temp = pd.read_csv(io.StringIO(res.text))
+                if not temp.empty:
+                    df = temp
+                    break
+        except Exception:
+            continue
 
     if df.empty:
-        raise RuntimeError("NASA FIRMS returned no live observations across VIIRS sensors.")
+        raise RuntimeError(f"NASA FIRMS returned 0 observations across VIIRS sensors for past {day_range} day(s).")
 
     rename_map = {
-        "latitude": "latitude",
-        "longitude": "longitude",
-        "bright_ti4": "bright_ti4",
-        "scan": "scan",
-        "track": "track",
-        "acq_date": "acq_date",
-        "acq_time": "acq_time",
-        "satellite": "satellite",
-        "instrument": "instrument",
-        "confidence": "confidence",
-        "version": "version",
-        "bright_ti5": "bright_ti5",
-        "frp": "frp",
-        "daynight": "daynight"
+        "latitude": "latitude", "longitude": "longitude", "bright_ti4": "bright_ti4",
+        "scan": "scan", "track": "track", "acq_date": "acq_date", "acq_time": "acq_time",
+        "satellite": "satellite", "instrument": "instrument", "confidence": "confidence",
+        "version": "version", "bright_ti5": "bright_ti5", "frp": "frp", "daynight": "daynight"
     }
     df = df.rename(columns=rename_map)
 
     if "acq_date" in df.columns and "acq_time" in df.columns:
         df["acq_time"] = df["acq_time"].astype(str).str.zfill(4)
         df["acquisition_datetime"] = pd.to_datetime(
-            df["acq_date"].astype(str)
-            + " "
-            + df["acq_time"].str[:2]
-            + ":"
-            + df["acq_time"].str[2:],
+            df["acq_date"].astype(str) + " " + df["acq_time"].str[:2] + ":" + df["acq_time"].str[2:],
             errors="coerce"
         )
 
-    numeric_cols = [
-        "latitude", "longitude", "bright_ti4", "bright_ti5", "frp", "scan", "track"
-    ]
-    for col in numeric_cols:
+    for col in ["latitude", "longitude", "bright_ti4", "bright_ti5", "frp", "scan", "track"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df = df.dropna(subset=["latitude", "longitude"]).copy()
-    df = df.reset_index(drop=True)
+    df = df.dropna(subset=["latitude", "longitude"]).reset_index(drop=True)
     df["hotspot_id"] = [f"LIVE_{i:06d}" for i in range(1, len(df) + 1)]
     df["fetched_at"] = pd.Timestamp.utcnow().isoformat()
-
     return df
 
 # ============================================================
-# FACILITY ATTRIBUTION
+# CLUSTERING (DBSCAN) & FACILITY ATTRIBUTION
 # ============================================================
+
+def apply_spatial_clustering(df):
+    """Groups dense clusters of fire hotspots within ~5km."""
+    if len(df) < 2:
+        df["cluster_id"] = "CLUSTER_000"
+        return df
+
+    coords_rad = np.radians(df[["latitude", "longitude"]].values)
+    # 5km epsilon in radians (5 / 6371)
+    db = DBSCAN(eps=5.0 / 6371.0, min_samples=2, metric='haversine')
+    clusters = db.fit_predict(coords_rad)
+    df["cluster_id"] = [f"CLUSTER_{c:03d}" if c != -1 else "ISOLATED" for c in clusters]
+    return df
 
 def attribute_facilities(live, facilities):
     live = live.copy()
     facilities = facilities.copy()
 
-    live["latitude"] = pd.to_numeric(live["latitude"], errors="coerce")
-    live["longitude"] = pd.to_numeric(live["longitude"], errors="coerce")
-    facilities["latitude"] = pd.to_numeric(facilities["latitude"], errors="coerce")
-    facilities["longitude"] = pd.to_numeric(facilities["longitude"], errors="coerce")
+    for d in [live, facilities]:
+        d["latitude"] = pd.to_numeric(d["latitude"], errors="coerce")
+        d["longitude"] = pd.to_numeric(d["longitude"], errors="coerce")
 
     live = live.dropna(subset=["latitude", "longitude"]).reset_index(drop=True)
     facilities = facilities.dropna(subset=["latitude", "longitude"]).reset_index(drop=True)
-
-    if facilities.empty:
-        raise RuntimeError("OSM facility dataset contains no valid coordinates.")
 
     facility_coords = np.radians(facilities[["latitude", "longitude"]].values)
     live_coords = np.radians(live[["latitude", "longitude"]].values)
@@ -162,99 +140,89 @@ def attribute_facilities(live, facilities):
     tree = BallTree(facility_coords, metric="haversine")
     distances, indices = tree.query(live_coords, k=1)
 
-    earth_radius_km = 6371.0088
-    distances_km = distances[:, 0] * earth_radius_km
+    distances_km = distances[:, 0] * 6371.0088
     nearest = facilities.iloc[indices[:, 0]].reset_index(drop=True)
 
     result = live.copy()
-
-    field_mapping = {
-        "facility_osm_id": "osm_id",
-        "facility_type": "feature_type",
-        "facility_name": "name",
-        "facility_power": "power",
-        "facility_industrial": "industrial",
-        "facility_landuse": "landuse",
-        "facility_operator": "operator",
-        "facility_plant_source": "plant_source",
-        "facility_plant_method": "plant_method"
+    fields = {
+        "facility_osm_id": "osm_id", "facility_type": "feature_type", "facility_name": "name",
+        "facility_power": "power", "facility_industrial": "industrial", "facility_landuse": "landuse",
+        "facility_operator": "operator", "facility_plant_source": "plant_source", "facility_plant_method": "plant_method"
     }
-
-    for output_col, input_col in field_mapping.items():
-        if input_col in nearest.columns:
-            result[output_col] = nearest[input_col].values
-        else:
-            result[output_col] = np.nan
+    for out_col, in_col in fields.items():
+        result[out_col] = nearest[in_col].values if in_col in nearest.columns else np.nan
 
     result["facility_latitude"] = nearest["latitude"].values
     result["facility_longitude"] = nearest["longitude"].values
     result["distance_to_facility_km"] = distances_km
 
-    def proximity(distance):
-        if distance <= 1:
-            return "VERY_CLOSE"
-        elif distance <= 2:
-            return "CLOSE"
-        elif distance <= 5:
-            return "NEAR"
-        elif distance <= 10:
-            return "DISTANT"
-        return "FAR"
-
-    result["proximity_category"] = result["distance_to_facility_km"].apply(proximity)
-
-    def quality(distance):
-        if distance <= 1:
-            return "HIGH"
-        elif distance <= 5:
-            return "MEDIUM"
-        elif distance <= 10:
-            return "LOW"
-        return "VERY_LOW"
-
-    result["facility_match_quality"] = result["distance_to_facility_km"].apply(quality)
+    result["proximity_category"] = result["distance_to_facility_km"].apply(
+        lambda d: "VERY_CLOSE" if d <= 1 else ("CLOSE" if d <= 2 else ("NEAR" if d <= 5 else ("DISTANT" if d <= 10 else "FAR")))
+    )
+    result["facility_match_quality"] = result["distance_to_facility_km"].apply(
+        lambda d: "HIGH" if d <= 1 else ("MEDIUM" if d <= 5 else ("LOW" if d <= 10 else "VERY_LOW"))
+    )
     return result
 
 # ============================================================
-# FEATURE ENGINEERING
+# WEATHER & SMOKE DISPERSION ENGINE (OPEN-METEO)
 # ============================================================
+
+@st.cache_data(ttl=1800)
+def fetch_weather_vector(lat, lon):
+    try:
+        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=wind_speed_10m,wind_direction_10m,relative_humidity_2m"
+        res = requests.get(url, timeout=5).json()
+        current = res.get("current", {})
+        speed = current.get("wind_speed_10m", 0)
+        direction = current.get("wind_direction_10m", 0)
+        humidity = current.get("relative_humidity_2m", 50)
+        return speed, direction, humidity
+    except Exception:
+        return 0.0, 0, 50
+
+def get_compass_bearing(deg):
+    dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+    ix = int((deg + 11.25) / 22.5) % 16
+    return dirs[ix]
+
+# ============================================================
+# FEATURE ENGINEERING & V5 PREDICTION
+# ============================================================
+
+FEATURES = [
+    "mean_frp", "max_frp", "frp_ratio", "mean_brightness", "max_brightness", "brightness_range",
+    "observation_count", "persistence_days", "observations_per_day", "activity_density", "satellite_count",
+    "distance_to_facility_km", "facility_within_1km", "facility_within_5km",
+    "persistent_long_term", "persistent_180_days", "facility_type", "facility_power", "facility_industrial", "facility_landuse",
+    "frp_ratio_v5", "frp_excess_v5", "frp_log_v5", "max_frp_log_v5", "brightness_range_v5", "brightness_ratio_v5",
+    "brightness_excess_v5", "persistence_log_v5", "persistence_months_v5", "persistent_30d_v5", "persistent_90d_v5",
+    "persistent_180d_v5", "persistent_270d_v5", "observation_log_v5", "obs_per_persistence_v5", "activity_persistence_v5",
+    "distance_log_v5", "very_close_v5", "within_2km_v5", "within_5km_v5", "within_10km_v5",
+    "frp_persistence_v5", "frp_distance_signal_v5", "activity_distance_signal_v5"
+]
 
 def engineer_features(df):
     df = df.copy()
-
     df["mean_frp"] = pd.to_numeric(df.get("frp", 0), errors="coerce").fillna(0)
     df["max_frp"] = df["mean_frp"]
     df["frp_ratio"] = df["max_frp"] / (df["mean_frp"] + 1e-6)
-
     df["mean_brightness"] = pd.to_numeric(df.get("bright_ti4", 0), errors="coerce").fillna(0)
     df["max_brightness"] = df["mean_brightness"]
     df["brightness_range"] = 0.0
-
     df["observation_count"] = 1
     df["persistence_days"] = 1
     df["observations_per_day"] = 1.0
     df["activity_density"] = 1.0
     df["satellite_count"] = 1
-
-    if "distance_to_facility_km" not in df:
-        df["distance_to_facility_km"] = 999.0
-
-    df["distance_to_facility_km"] = pd.to_numeric(
-        df["distance_to_facility_km"], errors="coerce"
-    ).fillna(999.0)
-
+    df["distance_to_facility_km"] = pd.to_numeric(df.get("distance_to_facility_km", 999.0), errors="coerce").fillna(999.0)
     df["facility_within_1km"] = (df["distance_to_facility_km"] <= 1).astype(int)
     df["facility_within_5km"] = (df["distance_to_facility_km"] <= 5).astype(int)
     df["persistent_long_term"] = 0
     df["persistent_180_days"] = 0
 
-    categorical = [
-        "facility_type", "facility_power", "facility_industrial", "facility_landuse"
-    ]
-    for col in categorical:
-        if col not in df.columns:
-            df[col] = "unknown"
-        df[col] = df[col].fillna("unknown").astype(str)
+    for col in ["facility_type", "facility_power", "facility_industrial", "facility_landuse"]:
+        df[col] = df[col].fillna("unknown").astype(str) if col in df.columns else "unknown"
 
     df["frp_ratio_v5"] = df["max_frp"] / (df["mean_frp"] + 1e-6)
     df["frp_excess_v5"] = np.maximum(df["max_frp"] - 5.0, 0)
@@ -280,190 +248,312 @@ def engineer_features(df):
     df["frp_persistence_v5"] = df["mean_frp"] * df["persistence_days"]
     df["frp_distance_signal_v5"] = df["mean_frp"] / (df["distance_to_facility_km"] + 1)
     df["activity_distance_signal_v5"] = df["activity_density"] / (df["distance_to_facility_km"] + 1)
-
     return df
-
-# ============================================================
-# EXACT V5 FEATURES
-# ============================================================
-
-FEATURES = [
-    "mean_frp", "max_frp", "frp_ratio",
-    "mean_brightness", "max_brightness", "brightness_range",
-    "observation_count", "persistence_days", "observations_per_day", "activity_density", "satellite_count",
-    "distance_to_facility_km", "facility_within_1km", "facility_within_5km",
-    "persistent_long_term", "persistent_180_days",
-    "facility_type", "facility_power", "facility_industrial", "facility_landuse",
-    "frp_ratio_v5", "frp_excess_v5", "frp_log_v5", "max_frp_log_v5",
-    "brightness_range_v5", "brightness_ratio_v5", "brightness_excess_v5",
-    "persistence_log_v5", "persistence_months_v5",
-    "persistent_30d_v5", "persistent_90d_v5", "persistent_180d_v5", "persistent_270d_v5",
-    "observation_log_v5", "obs_per_persistence_v5", "activity_persistence_v5",
-    "distance_log_v5",
-    "very_close_v5", "within_2km_v5", "within_5km_v5", "within_10km_v5",
-    "frp_persistence_v5", "frp_distance_signal_v5", "activity_distance_signal_v5"
-]
-
-# ============================================================
-# V5 PREDICTION
-# ============================================================
 
 def run_v5_prediction(df, model):
     df = engineer_features(df)
-
-    missing = [col for col in FEATURES if col not in df.columns]
-    if missing:
-        raise RuntimeError("Missing V5 features: " + str(missing))
-
     X = df[FEATURES].copy()
 
-    numeric_features = X.select_dtypes(include=["number"]).columns
-    X[numeric_features] = (
-        X[numeric_features]
-        .replace([np.inf, -np.inf], np.nan)
-        .fillna(0)
+    num_cols = X.select_dtypes(include=["number"]).columns
+    X[num_cols] = X[num_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
+    for cat in ["facility_type", "facility_power", "facility_industrial", "facility_landuse"]:
+        X[cat] = X[cat].fillna("unknown").astype(str)
+
+    preds = model.predict(X)
+    probs = model.predict_proba(X)
+    conf = np.max(probs, axis=1) * 100
+
+    df["predicted_source"] = preds
+    df["confidence"] = conf.round(1)
+
+    # Risk Score Formulation
+    frp_c = np.clip(df["mean_frp"] * 3, 0, 35)
+    mfrp_c = np.clip(df["max_frp"] * 0.5, 0, 20)
+    conf_c = conf * 0.20
+    prox_c = np.where(df["distance_to_facility_km"] <= 1.0, 25, np.where(df["distance_to_facility_km"] <= 5.0, 15, 0))
+
+    risk = np.clip(frp_c + mfrp_c + conf_c + prox_c, 0, 100)
+    df["live_risk_score"] = risk.round(2)
+    df["live_risk_category"] = df["live_risk_score"].apply(
+        lambda s: "CRITICAL" if s >= 75 else ("HIGH" if s >= 50 else ("MEDIUM" if s >= 25 else "LOW"))
     )
-
-    categorical_features = [
-        "facility_type",
-        "facility_power",
-        "facility_industrial",
-        "facility_landuse"
-    ]
-    for col in categorical_features:
-        X[col] = X[col].fillna("unknown").astype(str)
-
-    predictions = model.predict(X)
-    probabilities = model.predict_proba(X)
-    confidence = np.max(probabilities, axis=1) * 100
-
-    df["predicted_source"] = predictions
-    df["confidence"] = confidence.round(1)
-
-    frp_component = np.clip(df["mean_frp"] * 3, 0, 35)
-    max_frp_component = np.clip(df["max_frp"] * 0.5, 0, 20)
-    confidence_component = confidence * 0.20
-
-    risk_score = frp_component + max_frp_component + confidence_component
-    risk_score = np.clip(risk_score, 0, 100)
-    df["live_risk_score"] = risk_score.round(2)
-
-    def risk_category(score):
-        if score >= 75:
-            return "CRITICAL"
-        elif score >= 50:
-            return "HIGH"
-        elif score >= 25:
-            return "MEDIUM"
-        return "LOW"
-
-    df["live_risk_category"] = df["live_risk_score"].apply(risk_category)
     return df
 
 # ============================================================
-# HEADER & SIDEBAR
+# DISCORD / TELEGRAM ALERT DISPATCHER
 # ============================================================
 
-st.title("🔥 ThermoWatch AI")
-st.subheader("LIVE Satellite Fire Detection & Industrial Risk Intelligence")
-st.caption("NASA FIRMS → OSM Facilities → V5 AI → Risk Assessment")
+def send_webhook_alert(webhook_url, top_incident):
+    if not webhook_url:
+        return False
+    msg = {
+        "content": f"🚨 **CRITICAL FIRE INCIDENT DETECTED** 🚨\n"
+                   f"- **ID:** `{top_incident.get('hotspot_id')}`\n"
+                   f"- **Risk Level:** `{top_incident.get('live_risk_category')}` (Score: {top_incident.get('live_risk_score')}/100)\n"
+                   f"- **Source:** `{top_incident.get('predicted_source')}`\n"
+                   f"- **Nearest Facility:** {top_incident.get('facility_name', 'Unknown')} ({top_incident.get('distance_to_facility_km', 0):.2f} km)\n"
+                   f"- **FRP:** {top_incident.get('frp')} MW\n"
+                   f"- **Coordinates:** `{top_incident.get('latitude')}, {top_incident.get('longitude')}`\n"
+                   f"- **Maps Link:** https://www.google.com/maps?q={top_incident.get('latitude')},{top_incident.get('longitude')}"
+    }
+    try:
+        requests.post(webhook_url, json=msg, timeout=5)
+        return True
+    except Exception:
+        return False
 
-st.sidebar.header("ThermoWatch Controls")
+# ============================================================
+# PDF INCIDENT REPORT GENERATOR
+# ============================================================
 
-if st.sidebar.button("🔄 Fetch Latest LIVE Data"):
+def generate_pdf_report(df):
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
+    styles = getSampleStyleSheet()
+    story = []
+
+    title_style = ParagraphStyle(name='TitleStyle', parent=styles['Heading1'], fontSize=18, textColor=colors.HexColor("#b91c1c"))
+    story.append(Paragraph("ThermoWatch AI — Threat & Emission Audit Report", title_style))
+    story.append(Paragraph(f"Generated on: {pd.Timestamp.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC", styles['Normal']))
+    story.append(Spacer(1, 15))
+
+    # Summary
+    summary_text = (
+        f"<b>Total Hotspots:</b> {len(df)} | "
+        f"<b>Critical Incidents:</b> {(df['live_risk_category'] == 'CRITICAL').sum()} | "
+        f"<b>High Risk:</b> {(df['live_risk_category'] == 'HIGH').sum()} | "
+        f"<b>Average Risk Score:</b> {df['live_risk_score'].mean():.2f}"
+    )
+    story.append(Paragraph(summary_text, styles['Normal']))
+    story.append(Spacer(1, 15))
+
+    # Table Top 15 Incidents
+    table_data = [["ID", "Lat/Lon", "Source", "Confidence", "Facility", "Dist(km)", "Risk"]]
+    top_15 = df.sort_values("live_risk_score", ascending=False).head(15)
+
+    for _, row in top_15.iterrows():
+        table_data.append([
+            str(row["hotspot_id"]),
+            f"{row['latitude']:.2f}, {row['longitude']:.2f}",
+            str(row["predicted_source"]),
+            f"{row['confidence']}%",
+            str(row.get("facility_name", "N/A"))[:15],
+            f"{row['distance_to_facility_km']:.1f}",
+            str(row["live_risk_category"])
+        ])
+
+    t = Table(table_data, colWidths=[65, 80, 80, 65, 110, 55, 65])
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#1e293b")),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+    ]))
+    story.append(t)
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+# ============================================================
+# SIDEBAR CONTROLS & WEBHOOK SETUP
+# ============================================================
+
+st.sidebar.title("🛡️ Mission Control")
+
+lookback_days = st.sidebar.slider("FIRMS Lookback Period (Days)", min_value=1, max_value=5, value=1)
+min_confidence_filter = st.sidebar.slider("Minimum AI Confidence (%)", min_value=0, max_value=100, value=0)
+
+st.sidebar.subheader("📡 Incident Webhook Dispatch")
+webhook_url = st.sidebar.text_input("Discord/Slack Webhook URL", type="password", placeholder="https://discord.com/api/webhooks/...")
+
+if st.sidebar.button("🔄 Trigger Realtime Pipeline"):
     st.cache_data.clear()
     st.rerun()
 
-st.sidebar.info("Live observations are fetched directly from NASA FIRMS VIIRS sensors over India.")
-
 # ============================================================
-# MAIN PIPELINE
+# EXECUTION PIPELINE
 # ============================================================
 
 try:
-    with st.spinner("Loading V5 AI model..."):
+    with st.spinner("Synchronizing AI Engine & Global Databases..."):
         model = load_model()
-
-    with st.spinner("Loading OSM facility database..."):
         facilities = load_osm_facilities()
-
-    with st.spinner("Fetching LIVE NASA FIRMS observations..."):
-        live = fetch_live_firms()
-
-    with st.spinner("Matching hotspots with nearest facilities..."):
-        attributed = attribute_facilities(live, facilities)
-
-    with st.spinner("Running V5 AI inference..."):
+        live_raw = fetch_live_firms(day_range=lookback_days)
+        clustered = apply_spatial_clustering(live_raw)
+        attributed = attribute_facilities(clustered, facilities)
         predictions = run_v5_prediction(attributed, model)
+
+    # Filter by user criteria
+    predictions = predictions[predictions["confidence"] >= min_confidence_filter].reset_index(drop=True)
 
 except Exception as e:
     st.error("ThermoWatch LIVE pipeline failed.")
     st.exception(e)
     st.stop()
 
+# Header banner
+st.title("🔥 ThermoWatch AI — Planetary Thermal Intelligence")
+st.caption("Live NASA VIIRS + OpenStreetMap Haversine BallTree + V5 Classifier + Open-Meteo Dispersion Matrix")
+
 # ============================================================
-# DASHBOARD VISUALIZATIONS
+# EXECUTIVE DASHBOARD METRICS
 # ============================================================
 
-st.success(f"LIVE pipeline completed — {len(predictions)} hotspots analyzed.")
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Hotspots Detected", len(predictions))
+c2.metric("Clusters Formed", predictions["cluster_id"].nunique())
+c3.metric("Critical Risks", int((predictions["live_risk_category"] == "CRITICAL").sum()))
+c4.metric("High Risks", int((predictions["live_risk_category"] == "HIGH").sum()))
+c5.metric("Avg Fleet Risk", f"{predictions['live_risk_score'].mean():.1f}/100")
 
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    st.metric("LIVE Hotspots", len(predictions))
-with col2:
-    st.metric("High Risk", int((predictions["live_risk_category"] == "HIGH").sum()))
-with col3:
-    st.metric("Critical", int((predictions["live_risk_category"] == "CRITICAL").sum()))
-with col4:
-    st.metric("Avg Risk", round(predictions["live_risk_score"].mean(), 2))
+# Dispatch alert button
+if st.sidebar.button("🚨 Broadcast Top Critical Event to Webhook"):
+    if not webhook_url:
+        st.sidebar.error("Please enter a valid webhook URL.")
+    else:
+        top_crit = predictions.sort_values("live_risk_score", ascending=False).iloc[0].to_dict()
+        if send_webhook_alert(webhook_url, top_crit):
+            st.sidebar.success("Dispatched alert successfully!")
+        else:
+            st.sidebar.error("Failed to deliver alert payload.")
 
-col_left, col_right = st.columns(2)
-with col_left:
-    st.header("Risk Distribution")
-    st.bar_chart(predictions["live_risk_category"].value_counts())
+# ============================================================
+# INTERACTIVE FOLIUM MAP (BUFFERS, HEATMAP & DISPERSION)
+# ============================================================
 
-with col_right:
-    st.header("AI Source Classification")
+st.subheader("🗺️ Geospatial Tactical Map & Industrial Hazard Zones")
+
+# Center around median coordinates
+map_center = [predictions["latitude"].median(), predictions["longitude"].median()]
+m = folium.Map(location=map_center, zoom_start=6, tiles="CartoDB dark_matter")
+
+# Add NASA Worldview Thermal Overlay TileLayer
+folium.TileLayer(
+    tiles="https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/MODIS_Terra_CorrectedReflectance_TrueColor/default/default/GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg",
+    attr="NASA GIBS TrueColor",
+    name="NASA Satellite Imagery",
+    overlay=True,
+    opacity=0.45
+).add_to(m)
+
+# Risk color mapper
+risk_color_map = {
+    "CRITICAL": "#ef4444",  # Red
+    "HIGH": "#f97316",      # Orange
+    "MEDIUM": "#eab308",    # Yellow
+    "LOW": "#22c55e"        # Green
+}
+
+for _, row in predictions.head(150).iterrows():
+    color = risk_color_map.get(row["live_risk_category"], "#3b82f6")
+    popup_html = f"""
+    <div style='font-family:sans-serif; width:220px;'>
+        <h4 style='margin:0; color:{color};'>{row['hotspot_id']} ({row['live_risk_category']})</h4>
+        <b>AI Source:</b> {row['predicted_source']} ({row['confidence']}%)<br>
+        <b>FRP:</b> {row['frp']} MW<br>
+        <b>Facility:</b> {row.get('facility_name', 'Unknown')}<br>
+        <b>Proximity:</b> {row['distance_to_facility_km']:.2f} km<br>
+        <b>Cluster:</b> {row['cluster_id']}
+    </div>
+    """
+    # Hotspot Circle Marker
+    folium.CircleMarker(
+        location=[row["latitude"], row["longitude"]],
+        radius=6 + (row["frp"] / 50.0),
+        color=color,
+        fill=True,
+        fill_color=color,
+        fill_opacity=0.8,
+        popup=folium.Popup(popup_html, max_width=250)
+    ).add_to(m)
+
+    # If within 2km of critical facility, draw danger buffer ring
+    if row["distance_to_facility_km"] <= 2.0:
+        folium.Circle(
+            location=[row["facility_latitude"], row["facility_longitude"]],
+            radius=1500,
+            color="#dc2626",
+            weight=1,
+            fill=True,
+            fill_opacity=0.15,
+            tooltip=f"Hazard Zone: {row.get('facility_name', 'Industrial Facility')}"
+        ).add_to(m)
+
+folium.LayerControl().add_to(m)
+st_folium(m, width="100%", height=520)
+
+# ============================================================
+# WEATHER & DISPERSION ANALYSIS FOR TOP THREAT
+# ============================================================
+
+st.subheader("🌪️ Atmospheric Dispersion & Smoke Vector Analysis")
+
+top_threat = predictions.sort_values("live_risk_score", ascending=False).iloc[0]
+w_speed, w_dir, w_humidity = fetch_weather_vector(top_threat["latitude"], top_threat["longitude"])
+cardinal = get_compass_bearing(w_dir)
+
+wc1, wc2, wc3, wc4 = st.columns(4)
+wc1.info(f"📍 **Target Area:** `{top_threat['hotspot_id']}` ({top_threat.get('facility_name', 'Unknown')})")
+wc2.metric("Surface Wind Speed", f"{w_speed} km/h")
+wc3.metric("Wind Vector", f"{w_dir}° ({cardinal})")
+wc4.metric("Ambient Humidity", f"{w_humidity}%")
+
+st.caption(f"⚠️ **Dispersion Trajectory:** Smoke & aerosol emissions are currently propagating towards the **{cardinal}** sector at **{w_speed} km/h**.")
+
+# ============================================================
+# ANALYTICS & BREAKDOWN
+# ============================================================
+
+col_a, col_b = st.columns(2)
+with col_a:
+    st.subheader("📊 Threat Distribution by AI Classification")
     st.bar_chart(predictions["predicted_source"].value_counts())
 
-st.header("LIVE Fire Hotspots")
-map_df = predictions[["latitude", "longitude"]].dropna()
-st.map(map_df)
+with col_b:
+    st.subheader("🏭 Cluster Density")
+    st.bar_chart(predictions["cluster_id"].value_counts().head(10))
 
-st.header("🚨 Highest Risk LIVE Detections")
-display_cols = [
-    "hotspot_id",
-    "facility_name",
-    "latitude",
-    "longitude",
-    "frp",
-    "predicted_source",
-    "confidence",
-    "distance_to_facility_km",
-    "facility_match_quality",
-    "live_risk_score",
-    "live_risk_category"
+# ============================================================
+# DETAILED AUDIT LOGS & REPORT DOWNLOADS
+# ============================================================
+
+st.subheader("🚨 Priority Triage Queue")
+
+table_cols = [
+    "hotspot_id", "cluster_id", "facility_name", "predicted_source",
+    "confidence", "frp", "distance_to_facility_km", "live_risk_score", "live_risk_category"
 ]
-display_cols = [c for c in display_cols if c in predictions.columns]
-
-top_risk = (
-    predictions
-    .sort_values("live_risk_score", ascending=False)[display_cols]
-    .head(20)
+st.dataframe(
+    predictions.sort_values("live_risk_score", ascending=False)[table_cols].head(30),
+    use_container_width=True,
+    hide_index=True
 )
-st.dataframe(top_risk, use_container_width=True, hide_index=True)
 
-st.header("Facility Proximity")
-st.bar_chart(predictions["proximity_category"].value_counts())
+st.subheader("📥 Export Tactical Data & Executive Briefings")
+d_col1, d_col2 = st.columns(2)
 
-st.header("Export LIVE Results")
-csv_data = predictions.to_csv(index=False).encode("utf-8")
-st.download_button(
-    label="⬇️ Download LIVE Predictions CSV",
-    data=csv_data,
-    file_name="thermowatch_live_predictions.csv",
-    mime="text/csv"
-)
+with d_col1:
+    csv_bytes = predictions.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="📄 Download Full Telemetry (CSV)",
+        data=csv_bytes,
+        file_name="thermowatch_audit_data.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+with d_col2:
+    pdf_bytes = generate_pdf_report(predictions)
+    st.download_button(
+        label="📑 Download Executive Incident Audit (PDF)",
+        data=pdf_bytes,
+        file_name="thermowatch_executive_report.pdf",
+        mime="application/pdf",
+        use_container_width=True
+    )
 
 st.divider()
-st.caption("ThermoWatch AI | LIVE FIRMS + OSM + V5 Machine Learning")
+st.caption("ThermoWatch AI Platform | Defense-Grade Environmental & Industrial Threat Intelligence")
