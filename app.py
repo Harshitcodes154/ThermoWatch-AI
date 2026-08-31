@@ -40,6 +40,10 @@ FIRMS_URL = "https://firms.modaps.eosdis.nasa.gov/api/area/csv/"
 INDIA_BBOX = "68.0,6.0,97.5,37.5"
 INDIA_CENTER = [22.9734, 78.6569]
 
+# 100% Free Tile Layer (No API Key Required)
+FREE_TILE_URL = "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png"
+FREE_TILE_ATTR = "&copy; <a href='https://www.openstreetmap.org/copyright'>OpenStreetMap</a> contributors &copy; <a href='https://carto.com/attributions'>CARTO</a>"
+
 # ============================================================
 # CACHED LOADERS (MODEL & OSM)
 # ============================================================
@@ -117,7 +121,7 @@ def apply_spatial_clustering(df):
         return df
 
     coords_rad = np.radians(df[["latitude", "longitude"]].values)
-    # 5 km epsilon
+    # 5 km spatial threshold
     db = DBSCAN(eps=5.0 / 6371.0, min_samples=2, metric='haversine')
     clusters = db.fit_predict(coords_rad)
     df["cluster_id"] = [f"CLUSTER_{c:03d}" if c != -1 else "ISOLATED" for c in clusters]
@@ -378,43 +382,46 @@ st.sidebar.info("Satellite: VIIRS NOAA-20 / SNPP / NOAA-21 (NASA FIRMS NRT Feed)
 st.title("🔥 ThermoWatch AI — Planetary Thermal Intelligence")
 st.caption(f"Realtime Satellite Thermal Detection over India Region | Active Window: **{selected_window_label}**")
 
-with st.spinner("Synchronizing AI weights & NASA FIRMS telemetry..."):
-    model = load_model()
-    facilities = load_osm_facilities()
-    raw_firms = fetch_live_firms(day_range=lookback_days)
+try:
+    with st.spinner("Synchronizing AI weights & NASA FIRMS telemetry..."):
+        model = load_model()
+        facilities = load_osm_facilities()
+        raw_firms = fetch_live_firms(day_range=lookback_days)
 
-if not raw_firms.empty:
-    clustered = apply_spatial_clustering(raw_firms)
-    attributed = attribute_facilities(clustered, facilities)
-    predictions = run_v5_prediction(attributed, model)
-    if min_conf > 0:
-        predictions = predictions[predictions["confidence"] >= min_conf].reset_index(drop=True)
-else:
-    predictions = pd.DataFrame()
+    if not raw_firms.empty:
+        clustered = apply_spatial_clustering(raw_firms)
+        attributed = attribute_facilities(clustered, facilities)
+        predictions = run_v5_prediction(attributed, model)
+        if min_conf > 0:
+            predictions = predictions[predictions["confidence"] >= min_conf].reset_index(drop=True)
+    else:
+        predictions = pd.DataFrame()
+
+except Exception as e:
+    st.error("System encountered an unexpected exception while loading resources.")
+    st.exception(e)
+    st.stop()
 
 # ============================================================
 # GRACEFUL NO-DETECTION STATE (NO CRASH)
 # ============================================================
 
 if predictions.empty:
-    st.success("✅ **Status Normal: No Active Thermal Anomalies Detected**")
     st.info(
-        f"NASA FIRMS reported **0 thermal hotspot incidents** across the Indian airspace for the **{selected_window_label}** window.\n\n"
-        "💡 *Tip: If you're investigating past seasonal events or stubble burning, expand the observation window up to 96 Hours (4 Days) from the sidebar.*"
+        f"ℹ️ **No Thermal Anomalies Found in {selected_window_label}**\n\n"
+        f"NASA FIRMS reported **0 active fire/thermal observations** across the Indian airspace for this time window.\n\n"
+        f"👉 **Tip:** To view previous activity or seasonal/stubble burns, select **48 Hours**, **72 Hours**, or **96 Hours** from the sidebar."
     )
     
-    # Clean fallback overview map
-    # Purana line:
-# m_empty = folium.Map(location=INDIA_CENTER, zoom_start=5, tiles="OpenStreetMap")
-
-# Naya 100% Free Tile:
-m_empty = folium.Map(
-    location=INDIA_CENTER, 
-    zoom_start=5, 
-    tiles="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",
-    attr="&copy; OpenStreetMap contributors &copy; CARTO"
-)
-st_folium(m_empty, width="100%", height=450)
+    # 100% Free OpenStreetMap via Carto tiles
+    m_empty = folium.Map(
+        location=INDIA_CENTER, 
+        zoom_start=5, 
+        tiles=FREE_TILE_URL, 
+        attr=FREE_TILE_ATTR
+    )
+    st_folium(m_empty, width="100%", height=450)
+    st.stop()
 
 # ============================================================
 # EXECUTIVE METRICS
@@ -431,16 +438,23 @@ c5.metric("Avg Fleet Risk", f"{predictions['live_risk_score'].mean():.1f} / 100"
 # INTERACTIVE INDIA HEATMAP & SPATIAL CLUSTERS
 # ============================================================
 
-st.subheader("🗺️ India Thermal Anomaly & Proximity Map")
+st.subheader("🗺️ India Thermal Anomaly & HeatMap")
 
 map_center = [predictions["latitude"].median(), predictions["longitude"].median()]
-m = folium.Map(location=map_center, zoom_start=5, tiles="CartoDB dark_matter")
+
+# Free Base Map Layer (No API Key Required)
+m = folium.Map(
+    location=map_center, 
+    zoom_start=5, 
+    tiles=FREE_TILE_URL, 
+    attr=FREE_TILE_ATTR
+)
 
 # 1. Density HeatMap Layer
 heat_data = [[row["latitude"], row["longitude"], float(row["frp"])] for _, row in predictions.iterrows()]
-HeatMap(heat_data, radius=16, blur=18, min_opacity=0.35, max_zoom=10).add_to(m)
+HeatMap(heat_data, radius=18, blur=20, min_opacity=0.4, max_zoom=10).add_to(m)
 
-# 2. Individual Point Markers & Danger Buffers
+# 2. Risk Marker Points & Danger Buffers
 risk_colors = {
     "CRITICAL": "#ef4444",
     "HIGH": "#f97316",
@@ -470,7 +484,7 @@ for _, row in predictions.head(200).iterrows():
         popup=folium.Popup(popup_html, max_width=250)
     ).add_to(m)
 
-    # Highlight near-facility hazards (within 2 km)
+    # Highlight danger buffer around facility if <= 2km
     if row["distance_to_facility_km"] <= 2.0:
         folium.Circle(
             location=[row["facility_latitude"], row["facility_longitude"]],
@@ -485,7 +499,7 @@ for _, row in predictions.head(200).iterrows():
 st_folium(m, width="100%", height=530)
 
 # ============================================================
-# WEATHER & DISPERSION VECTOR (TOP THREAT)
+# WEATHER & DISPERSION (TOP PRIORITY THREAT)
 # ============================================================
 
 top_threat = predictions.sort_values("live_risk_score", ascending=False).iloc[0]
@@ -494,11 +508,11 @@ cardinal = get_compass_bearing(w_dir)
 
 st.subheader("🌪️ Realtime Dispersion & Wind Vectors")
 wc1, wc2, wc3, wc4 = st.columns(4)
-wc1.info(f"📍 **Target:** `{top_threat['hotspot_id']}` ({top_threat.get('facility_name', 'Open Area')})")
+wc1.info(f"📍 **Target Focus:** `{top_threat['hotspot_id']}` ({top_threat.get('facility_name', 'Open Area')})")
 wc2.metric("Surface Wind Speed", f"{w_speed} km/h")
 wc3.metric("Wind Direction", f"{w_dir}° ({cardinal})")
 wc4.metric("Ambient Humidity", f"{w_humidity}%")
-st.caption(f"⚠️ **Dispersion Trajectory:** Smoke & toxic aerosol plumes are propagating towards the **{cardinal}** sector at **{w_speed} km/h**.")
+st.caption(f"⚠️ **Dispersion Trajectory:** Smoke & aerosol plumes are propagating towards the **{cardinal}** sector at **{w_speed} km/h**.")
 
 # ============================================================
 # CHARTS & ANALYTICS
@@ -514,7 +528,7 @@ with col_r:
     st.bar_chart(predictions["live_risk_category"].value_counts())
 
 # ============================================================
-# TRIAGE QUEUE & EXPORT OPTIONS
+# PRIORITY AUDIT QUEUE & EXPORT OPTIONS
 # ============================================================
 
 st.subheader("📋 Priority Hazard Audit Queue")
