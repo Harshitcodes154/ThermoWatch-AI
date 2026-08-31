@@ -500,52 +500,262 @@ def load_osm_facilities():
 
 def fetch_firms(hours):
 
-    if "FIRMS_API_KEY" not in st.secrets:
+    # ============================================================
+    # THERMOWATCH - FIRMS LIVE DATA FETCH
+    # FIRMS API maximum = 5 days per request
+    # ============================================================
 
+    if "FIRMS_API_KEY" not in st.secrets:
         raise RuntimeError(
-            "FIRMS_API_KEY is missing from "
-            "Streamlit Secrets."
+            "FIRMS_API_KEY is missing from Streamlit Secrets."
         )
 
-    api_key = st.secrets[
-        "FIRMS_API_KEY"
-    ]
+    api_key = st.secrets["FIRMS_API_KEY"]
 
-    # FIRMS endpoint accepts whole-day windows.
-    api_days = max(
-        1,
-        int(math.ceil(hours / 24))
-    )
+    # ------------------------------------------------------------
+    # Convert requested hours into days
+    # ------------------------------------------------------------
 
-    url = (
-        FIRMS_BASE_URL
-        + api_key
-        + "/VIIRS_NOAA20_NRT/"
-        + INDIA_BBOX
-        + f"/{api_days}"
-    )
+    requested_hours = max(1, int(hours))
+    requested_days = int(math.ceil(requested_hours / 24))
 
-    response = requests.get(
-        url,
-        timeout=180
-    )
+    # FIRMS allows maximum 5 days per request.
+    # Therefore:
+    #
+    # 1-5 days  -> one request
+    # >5 days   -> multiple requests
+    #
+    # Example:
+    # 7 days -> 5 days + 2 days
+    # ------------------------------------------------------------
 
-    response.raise_for_status()
+    all_frames = []
 
-    if not response.text.strip():
+    remaining_days = requested_days
+
+    while remaining_days > 0:
+
+        chunk_days = min(5, remaining_days)
+
+        print(
+            f"Fetching FIRMS data: "
+            f"{chunk_days} day chunk..."
+        )
+
+        url = (
+            FIRMS_BASE_URL
+            + api_key
+            + "/VIIRS_NOAA20_NRT/"
+            + INDIA_BBOX
+            + f"/{chunk_days}"
+        )
+
+        try:
+
+            response = requests.get(
+                url,
+                timeout=180
+            )
+
+            response.raise_for_status()
+
+        except requests.RequestException as e:
+
+            # Do not immediately crash the complete dashboard.
+            st.warning(
+                f"FIRMS request failed for "
+                f"{chunk_days}-day window: {e}"
+            )
+
+            remaining_days -= chunk_days
+            continue
+
+        # --------------------------------------------------------
+        # Empty response
+        # --------------------------------------------------------
+
+        if not response.text.strip():
+
+            remaining_days -= chunk_days
+            continue
+
+        try:
+
+            chunk_df = pd.read_csv(
+                io.StringIO(response.text)
+            )
+
+        except Exception as e:
+
+            st.warning(
+                f"Could not parse FIRMS response: {e}"
+            )
+
+            remaining_days -= chunk_days
+            continue
+
+        # --------------------------------------------------------
+        # Add valid data
+        # --------------------------------------------------------
+
+        if not chunk_df.empty:
+
+            all_frames.append(chunk_df)
+
+        remaining_days -= chunk_days
+
+    # ============================================================
+    # NO DATA
+    # ============================================================
+
+    if not all_frames:
 
         return pd.DataFrame()
 
-    df = pd.read_csv(
-        io.StringIO(
-            response.text
-        )
+    # ============================================================
+    # MERGE ALL FIRMS CHUNKS
+    # ============================================================
+
+    df = pd.concat(
+        all_frames,
+        ignore_index=True
     )
 
-    if df.empty:
+    # ============================================================
+    # REMOVE DUPLICATES
+    # ============================================================
 
-        return df
+    duplicate_columns = [
+        col
+        for col in [
+            "latitude",
+            "longitude",
+            "acq_date",
+            "acq_time",
+            "satellite",
+            "instrument"
+        ]
+        if col in df.columns
+    ]
 
+    if duplicate_columns:
+
+        df = df.drop_duplicates(
+            subset=duplicate_columns
+        )
+
+    # ============================================================
+    # CLEAN COORDINATES
+    # ============================================================
+
+    for col in [
+        "latitude",
+        "longitude",
+        "frp",
+        "bright_ti4",
+        "bright_ti5",
+        "scan",
+        "track"
+    ]:
+
+        if col in df.columns:
+
+            df[col] = pd.to_numeric(
+                df[col],
+                errors="coerce"
+            )
+
+    df = df.dropna(
+        subset=[
+            "latitude",
+            "longitude"
+        ]
+    ).copy()
+
+    # ============================================================
+    # INDIA BOUNDARY SAFETY FILTER
+    # ============================================================
+
+    # Prevent accidental points outside the intended region.
+    # Keep this broad enough for FIRMS India bounding box.
+    
+    if "latitude" in df.columns and "longitude" in df.columns:
+
+        df = df[
+            (df["latitude"] >= 6.0)
+            & (df["latitude"] <= 38.0)
+            & (df["longitude"] >= 68.0)
+            & (df["longitude"] <= 98.0)
+        ].copy()
+
+    # ============================================================
+    # CREATE ACQUISITION DATETIME
+    # ============================================================
+
+    if (
+        "acq_date" in df.columns
+        and "acq_time" in df.columns
+    ):
+
+        def make_datetime(row):
+
+            try:
+
+                date_value = str(
+                    row["acq_date"]
+                )
+
+                time_value = str(
+                    row["acq_time"]
+                ).split(".")[0]
+
+                # FIRMS time can be HHMM
+                time_value = time_value.zfill(4)
+
+                return pd.to_datetime(
+                    date_value
+                    + " "
+                    + time_value[:2]
+                    + ":"
+                    + time_value[2:4],
+                    errors="coerce"
+                )
+
+            except Exception:
+
+                return pd.NaT
+
+        df["acquisition_datetime"] = (
+            df.apply(
+                make_datetime,
+                axis=1
+            )
+        )
+
+    # ============================================================
+    # SORT BY MOST RECENT OBSERVATION
+    # ============================================================
+
+    if "acquisition_datetime" in df.columns:
+
+        df = df.sort_values(
+            "acquisition_datetime",
+            ascending=False
+        )
+
+    # ============================================================
+    # FINAL RESET
+    # ============================================================
+
+    df = df.reset_index(
+        drop=True
+    )
+
+    print(
+        f"FIRMS observations fetched: {len(df)}"
+    )
+
+    return df
     # --------------------------------------------------------
     # Build exact observation timestamp
     # --------------------------------------------------------
