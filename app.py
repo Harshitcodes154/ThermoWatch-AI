@@ -1,25 +1,31 @@
-import os
 import io
-from datetime import timedelta
+import math
+import html
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
 
 import requests
 import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
+import folium
 
 from sklearn.neighbors import BallTree
+from streamlit_folium import st_folium
+from folium.plugins import HeatMap, MarkerCluster
 
 
 # ============================================================
-# THERMO WATCH AI
-# NASA FIRMS -> OSM FACILITIES -> V5 AI -> RISK
+# THERMOWATCH AI
+# LIVE FIRMS -> TIME WINDOW -> OSM -> V5 AI -> RISK
 # ============================================================
 
 st.set_page_config(
     page_title="ThermoWatch AI",
     page_icon="🔥",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
 
@@ -39,34 +45,7 @@ HF_OSM_URL = (
     "resolve/main/osm_facilities.csv"
 )
 
-# Previous local result - useful as fallback/reference
-BASE_DIR = os.path.dirname(
-    os.path.abspath(__file__)
-)
-
-LOCAL_PREDICTIONS_FILE = os.path.join(
-    BASE_DIR,
-    "processed",
-    "live_final_predictions.csv"
-)
-
-LOCAL_FACILITY_FILE = os.path.join(
-    BASE_DIR,
-    "processed",
-    "osm_facilities.csv"
-)
-
-
-# ============================================================
-# FIRMS CONFIG
-# ============================================================
-
-FIRMS_API_KEY = st.secrets.get(
-    "FIRMS_API_KEY",
-    ""
-)
-
-FIRMS_URL = (
+FIRMS_BASE_URL = (
     "https://firms.modaps.eosdis.nasa.gov/"
     "api/area/csv/"
 )
@@ -75,8 +54,300 @@ FIRMS_URL = (
 # west, south, east, north
 INDIA_BBOX = "68.0,6.0,97.5,37.5"
 
+EARTH_RADIUS_KM = 6371.0088
+
 
 # ============================================================
+# CSS
+# ============================================================
+
+st.markdown(
+    """
+<style>
+
+.stApp {
+    background:
+        radial-gradient(
+            circle at 50% -20%,
+            rgba(18,42,68,.40),
+            transparent 45%
+        ),
+        #05080d;
+    color: #e7edf5;
+}
+
+.block-container {
+    padding-top: 1rem;
+    padding-bottom: 2rem;
+    max-width: 1600px;
+}
+
+.tw-header {
+    border: 1px solid #1b2a3a;
+    background: rgba(8,14,23,.96);
+    border-radius: 14px;
+    padding: 18px 22px;
+    margin-bottom: 15px;
+}
+
+.tw-title {
+    font-size: 28px;
+    font-weight: 900;
+    letter-spacing: .4px;
+}
+
+.tw-subtitle {
+    color: #8fa2b8;
+    font-size: 13px;
+    margin-top: 5px;
+    font-family: monospace;
+}
+
+.live-badge {
+    display: inline-block;
+    color: #29e3a2;
+    border: 1px solid #155e49;
+    background: #071b16;
+    border-radius: 6px;
+    padding: 4px 9px;
+    font-family: monospace;
+    font-size: 11px;
+    margin-top: 10px;
+}
+
+.metric-box {
+    border: 1px solid #172536;
+    background: linear-gradient(
+        180deg,
+        rgba(12,22,34,.95),
+        rgba(7,13,21,.95)
+    );
+    border-radius: 12px;
+    padding: 13px;
+}
+
+.section-title {
+    font-size: 18px;
+    font-weight: 850;
+    margin-top: 15px;
+    margin-bottom: 5px;
+}
+
+.section-subtitle {
+    color: #718096;
+    font-size: 11px;
+    font-family: monospace;
+    margin-bottom: 10px;
+}
+
+.notice {
+    border: 1px solid #26374a;
+    background: #0a111b;
+    border-radius: 9px;
+    padding: 11px 14px;
+    color: #9eb0c4;
+    font-size: 12px;
+    margin-bottom: 12px;
+}
+
+.no-fire {
+    border: 1px solid #28445b;
+    background:
+        linear-gradient(
+            135deg,
+            rgba(8,25,39,.95),
+            rgba(5,12,20,.95)
+        );
+    border-radius: 14px;
+    padding: 28px;
+    text-align: center;
+    margin: 15px 0;
+}
+
+.no-fire-title {
+    font-size: 22px;
+    font-weight: 850;
+    color: #d9e7f5;
+}
+
+.no-fire-text {
+    color: #8295aa;
+    font-size: 13px;
+    margin-top: 8px;
+}
+
+.alert-card {
+    border: 1px solid #202f40;
+    background: #09111b;
+    border-radius: 9px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+}
+
+.alert-title {
+    font-weight: 800;
+    margin-top: 3px;
+}
+
+.alert-meta {
+    color: #718096;
+    font-family: monospace;
+    font-size: 10px;
+    margin-top: 4px;
+}
+
+.footer {
+    color: #5f7083;
+    font-family: monospace;
+    font-size: 10px;
+    border-top: 1px solid #172536;
+    padding-top: 12px;
+    margin-top: 20px;
+}
+
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+# ============================================================
+# HEADER
+# ============================================================
+
+st.markdown(
+    """
+<div class="tw-header">
+    <div class="tw-title">🔥 ThermoWatch AI</div>
+    <div class="tw-subtitle">
+        LIVE SATELLITE FIRE DETECTION & INDUSTRIAL RISK INTELLIGENCE
+    </div>
+    <div class="tw-subtitle">
+        NASA FIRMS → OSM FACILITIES → V5 AI → RISK ASSESSMENT
+    </div>
+    <div class="live-badge">
+        ● LIVE SATELLITE THERMAL MONITORING
+    </div>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def clean_text(value, default="UNKNOWN"):
+    if value is None:
+        return default
+
+    try:
+        if pd.isna(value):
+            return default
+    except Exception:
+        pass
+
+    text = str(value).strip()
+
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return default
+
+    return text
+
+
+def safe_float(value, default=0.0):
+    try:
+        value = float(value)
+
+        if not np.isfinite(value):
+            return default
+
+        return value
+
+    except Exception:
+        return default
+
+
+def format_observed(value):
+
+    dt = pd.to_datetime(
+        value,
+        errors="coerce",
+        utc=True
+    )
+
+    if pd.isna(dt):
+        return "Unavailable"
+
+    return dt.strftime(
+        "%d %b %Y · %H:%M UTC"
+    )
+
+
+def data_age(value):
+
+    dt = pd.to_datetime(
+        value,
+        errors="coerce",
+        utc=True
+    )
+
+    if pd.isna(dt):
+        return "Unknown"
+
+    now = pd.Timestamp.now(
+        tz="UTC"
+    )
+
+    hours = max(
+        0,
+        (now - dt).total_seconds() / 3600
+    )
+
+    if hours < 1:
+        return f"{int(hours * 60)} min ago"
+
+    if hours < 24:
+        return f"{hours:.1f} hours ago"
+
+    return f"{hours / 24:.1f} days ago"
+
+
+def risk_color(risk):
+
+    risk = clean_text(
+        risk,
+        "LOW"
+    ).upper()
+
+    if risk == "CRITICAL":
+        return "#ff3154"
+
+    if risk == "HIGH":
+        return "#ff7547"
+
+    if risk == "MEDIUM":
+        return "#f5b942"
+
+    return "#35d6a1"
+
+
+def source_badge(source):
+
+    source = clean_text(
+        source,
+        "UNKNOWN"
+    ).upper()
+
+    return source.replace(
+        "_",
+        " "
+    )
+
+
+# ============================================================
+# FEATURE LIST
 # EXACT V5 FEATURES
 # ============================================================
 
@@ -99,7 +370,6 @@ FEATURES = [
     "distance_to_facility_km",
     "facility_within_1km",
     "facility_within_5km",
-
     "persistent_long_term",
     "persistent_180_days",
 
@@ -138,7 +408,7 @@ FEATURES = [
 
     "frp_persistence_v5",
     "frp_distance_signal_v5",
-    "activity_distance_signal_v5"
+    "activity_distance_signal_v5",
 ]
 
 
@@ -151,16 +421,20 @@ def load_model():
 
     response = requests.get(
         HF_MODEL_URL,
-        timeout=120
+        timeout=180,
+        allow_redirects=True
     )
 
-    response.raise_for_status()
+    if response.status_code != 200:
 
-    model = joblib.load(
+        raise RuntimeError(
+            f"Could not download V5 model. "
+            f"HTTP {response.status_code}"
+        )
+
+    return joblib.load(
         io.BytesIO(response.content)
     )
-
-    return model
 
 
 # ============================================================
@@ -170,172 +444,45 @@ def load_model():
 @st.cache_data(ttl=86400)
 def load_osm_facilities():
 
-    # --------------------------------------------------------
-    # First try Hugging Face
-    # --------------------------------------------------------
-
-    try:
-
-        response = requests.get(
-            HF_OSM_URL,
-            timeout=180
-        )
-
-        response.raise_for_status()
-
-        df = pd.read_csv(
-            io.BytesIO(
-                response.content
-            )
-        )
-
-        if not df.empty:
-            return df
-
-    except Exception as hf_error:
-
-        # ----------------------------------------------------
-        # Fallback to local file
-        # ----------------------------------------------------
-
-        if os.path.exists(
-            LOCAL_FACILITY_FILE
-        ):
-
-            return pd.read_csv(
-                LOCAL_FACILITY_FILE
-            )
-
-        raise RuntimeError(
-            "Unable to load OSM facility data.\n\n"
-            f"Hugging Face error: {hf_error}"
-        )
-
-    raise RuntimeError(
-        "OSM facility dataset is empty."
+    response = requests.get(
+        HF_OSM_URL,
+        timeout=300,
+        allow_redirects=True
     )
 
-
-# ============================================================
-# FETCH LIVE FIRMS
-# ============================================================
-
-@st.cache_data(ttl=900)
-def fetch_live_firms():
-
-    if not FIRMS_API_KEY:
+    if response.status_code != 200:
 
         raise RuntimeError(
-            "FIRMS_API_KEY is missing from "
-            "Streamlit Secrets."
+            f"Could not download OSM facilities. "
+            f"HTTP {response.status_code}"
         )
 
-    # --------------------------------------------------------
-    # VIIRS NOAA-20 NRT
-    # --------------------------------------------------------
-
-    url = (
-        FIRMS_URL
-        + FIRMS_API_KEY
-        + "/VIIRS_NOAA20_NRT/"
-        + INDIA_BBOX
-        + "/1"
+    df = pd.read_csv(
+        io.BytesIO(response.content)
     )
 
-    try:
-
-        response = requests.get(
-            url,
-            timeout=120
-        )
-
-        response.raise_for_status()
-
-    except requests.exceptions.RequestException as e:
-
-        raise RuntimeError(
-            f"NASA FIRMS request failed: {e}"
-        )
-
-    # --------------------------------------------------------
-    # Parse CSV
-    # --------------------------------------------------------
-
-    if not response.text.strip():
-
-        return pd.DataFrame()
-
-    try:
-
-        df = pd.read_csv(
-            io.StringIO(
-                response.text
-            )
-        )
-
-    except Exception as e:
-
-        raise RuntimeError(
-            f"Unable to parse NASA FIRMS response: {e}"
-        )
-
-    # --------------------------------------------------------
-    # Empty FIRMS response is NOT an error
-    # --------------------------------------------------------
-
-    if df.empty:
-
-        return pd.DataFrame()
-
-    # --------------------------------------------------------
-    # Required columns
-    # --------------------------------------------------------
-
-    required_columns = [
+    required = [
         "latitude",
         "longitude"
     ]
 
-    missing = [
-        c
-        for c in required_columns
-        if c not in df.columns
-    ]
+    for col in required:
 
-    if missing:
+        if col not in df.columns:
 
-        raise RuntimeError(
-            "NASA FIRMS response is missing "
-            "required columns: "
-            + ", ".join(missing)
-        )
-
-    # ========================================================
-    # CLEAN DATA
-    # ========================================================
-
-    numeric_columns = [
-
-        "latitude",
-        "longitude",
-
-        "bright_ti4",
-        "bright_ti5",
-
-        "scan",
-        "track",
-
-        "frp"
-    ]
-
-    for col in numeric_columns:
-
-        if col in df.columns:
-
-            df[col] = pd.to_numeric(
-                df[col],
-                errors="coerce"
+            raise RuntimeError(
+                f"OSM dataset missing column: {col}"
             )
+
+    df["latitude"] = pd.to_numeric(
+        df["latitude"],
+        errors="coerce"
+    )
+
+    df["longitude"] = pd.to_numeric(
+        df["longitude"],
+        errors="coerce"
+    )
 
     df = df.dropna(
         subset=[
@@ -344,93 +491,171 @@ def fetch_live_firms():
         ]
     ).copy()
 
-    if df.empty:
+    return df
+
+
+# ============================================================
+# FETCH FIRMS
+# ============================================================
+
+def fetch_firms(hours):
+
+    if "FIRMS_API_KEY" not in st.secrets:
+
+        raise RuntimeError(
+            "FIRMS_API_KEY is missing from "
+            "Streamlit Secrets."
+        )
+
+    api_key = st.secrets[
+        "FIRMS_API_KEY"
+    ]
+
+    # FIRMS endpoint accepts whole-day windows.
+    api_days = max(
+        1,
+        int(math.ceil(hours / 24))
+    )
+
+    url = (
+        FIRMS_BASE_URL
+        + api_key
+        + "/VIIRS_NOAA20_NRT/"
+        + INDIA_BBOX
+        + f"/{api_days}"
+    )
+
+    response = requests.get(
+        url,
+        timeout=180
+    )
+
+    response.raise_for_status()
+
+    if not response.text.strip():
 
         return pd.DataFrame()
 
-    # ========================================================
-    # CREATE ACQUISITION DATETIME
-    # ========================================================
+    df = pd.read_csv(
+        io.StringIO(
+            response.text
+        )
+    )
 
-    if (
-        "acq_date" in df.columns
-        and
-        "acq_time" in df.columns
-    ):
+    if df.empty:
 
-        df["acq_time"] = (
-            df["acq_time"]
+        return df
+
+    # --------------------------------------------------------
+    # Build exact observation timestamp
+    # --------------------------------------------------------
+
+    if "acquisition_datetime" in df.columns:
+
+        df["observed_at"] = pd.to_datetime(
+            df["acquisition_datetime"],
+            errors="coerce",
+            utc=True
+        )
+
+    elif {
+        "acq_date",
+        "acq_time"
+    }.issubset(df.columns):
+
+        date_part = (
+            df["acq_date"]
             .astype(str)
-            .str.replace(
-                ".0",
-                "",
-                regex=False
+            .str.strip()
+        )
+
+        time_part = (
+            pd.to_numeric(
+                df["acq_time"],
+                errors="coerce"
             )
+            .fillna(0)
+            .astype(int)
+            .astype(str)
             .str.zfill(4)
         )
 
-        df["acquisition_datetime"] = pd.to_datetime(
-            df["acq_date"].astype(str)
-            + " "
-            + df["acq_time"].str[:2]
-            + ":"
-            + df["acq_time"].str[2:],
+        df["observed_at"] = pd.to_datetime(
+            date_part + " " + time_part,
             errors="coerce",
             utc=True
         )
 
     else:
 
-        df["acquisition_datetime"] = pd.NaT
+        df["observed_at"] = pd.NaT
 
-    # ========================================================
-    # LAST 24 HOURS FILTER
-    # ========================================================
+    # --------------------------------------------------------
+    # Exact requested time window
+    # --------------------------------------------------------
 
-    now_utc = pd.Timestamp.now(
+    now = pd.Timestamp.now(
         tz="UTC"
     )
 
-    cutoff = (
-        now_utc
-        - pd.Timedelta(hours=24)
+    cutoff = now - pd.Timedelta(
+        hours=hours
     )
 
-    if (
-        "acquisition_datetime" in df.columns
-        and
-        df["acquisition_datetime"].notna().any()
-    ):
+    if df["observed_at"].notna().any():
 
         df = df[
-            (
-                df["acquisition_datetime"]
-                >= cutoff
-            )
+            (df["observed_at"] >= cutoff)
             &
-            (
-                df["acquisition_datetime"]
-                <= now_utc
-            )
+            (df["observed_at"] <= now)
         ].copy()
 
     # --------------------------------------------------------
-    # IMPORTANT:
-    # Empty last-24-hour result is NORMAL.
-    # Do NOT raise an exception.
+    # Numeric normalization
     # --------------------------------------------------------
 
-    if df.empty:
+    numeric_cols = [
+        "latitude",
+        "longitude",
+        "frp",
+        "bright_ti4",
+        "bright_ti5",
+        "confidence"
+    ]
 
-        return pd.DataFrame()
+    for col in numeric_cols:
 
-    # ========================================================
-    # HOTSPOT IDS
-    # ========================================================
+        if col not in df.columns:
 
-    df = df.reset_index(
-        drop=True
-    )
+            df[col] = np.nan
+
+        df[col] = pd.to_numeric(
+            df[col],
+            errors="coerce"
+        )
+
+    df = df.dropna(
+        subset=[
+            "latitude",
+            "longitude"
+        ]
+    ).copy()
+
+    # India coordinate sanity filter
+
+    df = df[
+        df["latitude"].between(
+            6,
+            38
+        )
+        &
+        df["longitude"].between(
+            68,
+            98
+        )
+    ].copy()
+
+    # Stable IDs
 
     df["hotspot_id"] = [
         f"LIVE_{i:06d}"
@@ -440,13 +665,9 @@ def fetch_live_firms():
         )
     ]
 
-    df["fetched_at"] = (
-        pd.Timestamp.now(
-            tz="UTC"
-        ).isoformat()
+    return df.reset_index(
+        drop=True
     )
-
-    return df
 
 
 # ============================================================
@@ -458,60 +679,11 @@ def attribute_facilities(
     facilities
 ):
 
-    live = live.copy()
-    facilities = facilities.copy()
-
-    # --------------------------------------------------------
-    # Coordinates
-    # --------------------------------------------------------
-
-    for col in [
-        "latitude",
-        "longitude"
-    ]:
-
-        live[col] = pd.to_numeric(
-            live[col],
-            errors="coerce"
-        )
-
-        facilities[col] = pd.to_numeric(
-            facilities[col],
-            errors="coerce"
-        )
-
-    live = live.dropna(
-        subset=[
-            "latitude",
-            "longitude"
-        ]
-    ).reset_index(
-        drop=True
-    )
-
-    facilities = facilities.dropna(
-        subset=[
-            "latitude",
-            "longitude"
-        ]
-    ).reset_index(
-        drop=True
-    )
-
     if live.empty:
 
-        return pd.DataFrame()
+        return live.copy()
 
-    if facilities.empty:
-
-        raise RuntimeError(
-            "OSM facility dataset contains "
-            "no valid coordinates."
-        )
-
-    # ========================================================
-    # BALL TREE
-    # ========================================================
+    result = live.copy()
 
     facility_coords = np.radians(
         facilities[
@@ -541,11 +713,9 @@ def attribute_facilities(
         k=1
     )
 
-    earth_radius_km = 6371.0088
-
     distances_km = (
         distances[:, 0]
-        * earth_radius_km
+        * EARTH_RADIUS_KM
     )
 
     nearest = facilities.iloc[
@@ -554,75 +724,71 @@ def attribute_facilities(
         drop=True
     )
 
-    result = live.copy()
+    result[
+        "distance_to_facility_km"
+    ] = distances_km
 
-    # ========================================================
-    # FACILITY FIELDS
-    # ========================================================
+    # --------------------------------------------------------
+    # Facility fields
+    # --------------------------------------------------------
 
-    field_mapping = {
+    mapping = {
 
-        "facility_osm_id":
-            "osm_id",
+        "osm_id":
+            "facility_osm_id",
 
-        "facility_type":
-            "feature_type",
+        "feature_type":
+            "facility_type",
 
-        "facility_name":
-            "name",
+        "name":
+            "facility_name",
 
-        "facility_power":
-            "power",
+        "power":
+            "facility_power",
 
-        "facility_industrial":
-            "industrial",
+        "industrial":
+            "facility_industrial",
 
-        "facility_landuse":
-            "landuse",
+        "landuse":
+            "facility_landuse",
 
-        "facility_operator":
-            "operator",
+        "operator":
+            "facility_operator",
 
-        "facility_plant_source":
-            "plant_source",
+        "plant_source":
+            "facility_plant_source",
 
-        "facility_plant_method":
-            "plant_method"
+        "plant_method":
+            "facility_plant_method",
     }
 
-    for output_col, input_col in field_mapping.items():
+    for source, target in mapping.items():
 
-        if input_col in nearest.columns:
+        if source in nearest.columns:
 
-            result[output_col] = (
-                nearest[
-                    input_col
-                ].values
+            result[target] = (
+                nearest[source].values
             )
 
         else:
 
-            result[output_col] = np.nan
+            result[target] = np.nan
 
-    result["facility_latitude"] = (
-        nearest[
-            "latitude"
-        ].values
-    )
+    result[
+        "facility_latitude"
+    ] = nearest[
+        "latitude"
+    ].values
 
-    result["facility_longitude"] = (
-        nearest[
-            "longitude"
-        ].values
-    )
+    result[
+        "facility_longitude"
+    ] = nearest[
+        "longitude"
+    ].values
 
-    result["distance_to_facility_km"] = (
-        distances_km
-    )
-
-    # ========================================================
-    # PROXIMITY
-    # ========================================================
+    # --------------------------------------------------------
+    # Proximity
+    # --------------------------------------------------------
 
     def proximity(distance):
 
@@ -642,16 +808,13 @@ def attribute_facilities(
 
     result[
         "proximity_category"
-    ] = (
-        result[
-            "distance_to_facility_km"
-        ]
-        .apply(proximity)
-    )
+    ] = result[
+        "distance_to_facility_km"
+    ].apply(proximity)
 
-    # ========================================================
-    # MATCH QUALITY
-    # ========================================================
+    # --------------------------------------------------------
+    # Attribution quality
+    # --------------------------------------------------------
 
     def quality(distance):
 
@@ -668,12 +831,9 @@ def attribute_facilities(
 
     result[
         "facility_match_quality"
-    ] = (
-        result[
-            "distance_to_facility_km"
-        ]
-        .apply(quality)
-    )
+    ] = result[
+        "distance_to_facility_km"
+    ].apply(quality)
 
     return result
 
@@ -686,65 +846,60 @@ def engineer_features(df):
 
     df = df.copy()
 
-    # ========================================================
-    # FRP
-    # ========================================================
+    # --------------------------------------------------------
+    # Thermal values
+    # --------------------------------------------------------
 
-    df["mean_frp"] = (
-        pd.to_numeric(
-            df.get(
-                "frp",
-                0
-            ),
-            errors="coerce"
-        )
-        .fillna(0)
-    )
+    df["mean_frp"] = pd.to_numeric(
+        df["frp"],
+        errors="coerce"
+    ).fillna(0)
 
-    df["max_frp"] = (
-        df["mean_frp"]
-    )
+    df["max_frp"] = df[
+        "mean_frp"
+    ]
 
     df["frp_ratio"] = (
         df["max_frp"]
         /
-        (
-            df["mean_frp"]
-            + 1e-6
-        )
+        (df["mean_frp"] + 1e-6)
     )
 
-    # ========================================================
-    # BRIGHTNESS
-    # ========================================================
+    # --------------------------------------------------------
+    # Brightness
+    # --------------------------------------------------------
 
     if "bright_ti4" in df.columns:
 
         brightness = pd.to_numeric(
             df["bright_ti4"],
             errors="coerce"
-        ).fillna(0)
+        )
+
+        df["mean_brightness"] = (
+            brightness
+            .fillna(0)
+        )
+
+        df["max_brightness"] = (
+            brightness
+            .fillna(0)
+        )
 
     else:
 
-        brightness = pd.Series(
-            0.0,
-            index=df.index
-        )
+        df["mean_brightness"] = 0.0
+        df["max_brightness"] = 0.0
 
-    df["mean_brightness"] = (
-        brightness
+    df["brightness_range"] = (
+        df["max_brightness"]
+        -
+        df["mean_brightness"]
     )
 
-    df["max_brightness"] = (
-        brightness
-    )
-
-    df["brightness_range"] = 0.0
-
-    # ========================================================
-    # OBSERVATION FEATURES
-    # ========================================================
+    # --------------------------------------------------------
+    # Observation
+    # --------------------------------------------------------
 
     df["observation_count"] = 1
 
@@ -756,9 +911,9 @@ def engineer_features(df):
 
     df["satellite_count"] = 1
 
-    # ========================================================
-    # FACILITY FEATURES
-    # ========================================================
+    # --------------------------------------------------------
+    # Facility context
+    # --------------------------------------------------------
 
     if "distance_to_facility_km" not in df.columns:
 
@@ -773,37 +928,28 @@ def engineer_features(df):
             "distance_to_facility_km"
         ],
         errors="coerce"
-    ).fillna(999)
+    ).fillna(999.0)
 
     df["facility_within_1km"] = (
-        df[
-            "distance_to_facility_km"
-        ] <= 1
+        df["distance_to_facility_km"] <= 1
     ).astype(int)
 
     df["facility_within_5km"] = (
-        df[
-            "distance_to_facility_km"
-        ] <= 5
+        df["distance_to_facility_km"] <= 5
     ).astype(int)
 
     df["persistent_long_term"] = 0
 
     df["persistent_180_days"] = 0
 
-    # ========================================================
-    # CATEGORICAL
-    # ========================================================
-
-    categorical = [
-
+    categorical_defaults = [
         "facility_type",
         "facility_power",
         "facility_industrial",
-        "facility_landuse"
+        "facility_landuse",
     ]
 
-    for col in categorical:
+    for col in categorical_defaults:
 
         if col not in df.columns:
 
@@ -815,17 +961,14 @@ def engineer_features(df):
             .astype(str)
         )
 
-    # ========================================================
-    # V5 FEATURES
-    # ========================================================
+    # --------------------------------------------------------
+    # V5 features
+    # --------------------------------------------------------
 
     df["frp_ratio_v5"] = (
         df["max_frp"]
         /
-        (
-            df["mean_frp"]
-            + 1e-6
-        )
+        (df["mean_frp"] + 1e-6)
     )
 
     df["frp_excess_v5"] = np.maximum(
@@ -841,7 +984,9 @@ def engineer_features(df):
         df["max_frp"]
     )
 
-    df["brightness_range_v5"] = 0.0
+    df["brightness_range_v5"] = (
+        df["brightness_range"]
+    )
 
     df["brightness_ratio_v5"] = 1.0
 
@@ -852,8 +997,7 @@ def engineer_features(df):
     )
 
     df["persistence_months_v5"] = (
-        df["persistence_days"]
-        / 30.0
+        df["persistence_days"] / 30.0
     )
 
     df["persistent_30d_v5"] = (
@@ -879,10 +1023,7 @@ def engineer_features(df):
     df["obs_per_persistence_v5"] = (
         df["observation_count"]
         /
-        (
-            df["persistence_days"]
-            + 1e-6
-        )
+        (df["persistence_days"] + 1e-6)
     )
 
     df["activity_persistence_v5"] = (
@@ -892,33 +1033,23 @@ def engineer_features(df):
     )
 
     df["distance_log_v5"] = np.log1p(
-        df[
-            "distance_to_facility_km"
-        ]
+        df["distance_to_facility_km"]
     )
 
     df["very_close_v5"] = (
-        df[
-            "distance_to_facility_km"
-        ] <= 1
+        df["distance_to_facility_km"] <= 1
     ).astype(int)
 
     df["within_2km_v5"] = (
-        df[
-            "distance_to_facility_km"
-        ] <= 2
+        df["distance_to_facility_km"] <= 2
     ).astype(int)
 
     df["within_5km_v5"] = (
-        df[
-            "distance_to_facility_km"
-        ] <= 5
+        df["distance_to_facility_km"] <= 5
     ).astype(int)
 
     df["within_10km_v5"] = (
-        df[
-            "distance_to_facility_km"
-        ] <= 10
+        df["distance_to_facility_km"] <= 10
     ).astype(int)
 
     df["frp_persistence_v5"] = (
@@ -953,7 +1084,7 @@ def engineer_features(df):
 
 
 # ============================================================
-# RUN V5 AI
+# V5 PREDICTION
 # ============================================================
 
 def run_v5_prediction(
@@ -963,7 +1094,7 @@ def run_v5_prediction(
 
     if df.empty:
 
-        return pd.DataFrame()
+        return df.copy()
 
     df = engineer_features(
         df
@@ -986,15 +1117,13 @@ def run_v5_prediction(
         FEATURES
     ].copy()
 
-    # ========================================================
-    # NUMERIC CLEANUP
-    # ========================================================
+    # --------------------------------------------------------
+    # Numeric cleanup
+    # --------------------------------------------------------
 
-    numeric_features = (
-        X.select_dtypes(
-            include=["number"]
-        ).columns
-    )
+    numeric_features = X.select_dtypes(
+        include=["number"]
+    ).columns
 
     X[numeric_features] = (
         X[numeric_features]
@@ -1008,12 +1137,11 @@ def run_v5_prediction(
         .fillna(0)
     )
 
-    # ========================================================
-    # CATEGORICAL CLEANUP
-    # ========================================================
+    # --------------------------------------------------------
+    # Categorical cleanup
+    # --------------------------------------------------------
 
     categorical_features = [
-
         "facility_type",
         "facility_power",
         "facility_industrial",
@@ -1028,9 +1156,9 @@ def run_v5_prediction(
             .astype(str)
         )
 
-    # ========================================================
-    # PREDICTION
-    # ========================================================
+    # --------------------------------------------------------
+    # Prediction
+    # --------------------------------------------------------
 
     predictions = model.predict(
         X
@@ -1048,17 +1176,17 @@ def run_v5_prediction(
         * 100
     )
 
-    df[
-        "predicted_source"
-    ] = predictions
+    df["predicted_source"] = (
+        predictions
+    )
 
-    df[
-        "confidence"
-    ] = confidence.round(1)
+    df["confidence"] = (
+        confidence.round(1)
+    )
 
-    # ========================================================
-    # RISK SCORE
-    # ========================================================
+    # --------------------------------------------------------
+    # Risk score
+    # --------------------------------------------------------
 
     frp_component = np.clip(
         df["mean_frp"] * 3,
@@ -1084,19 +1212,11 @@ def run_v5_prediction(
         confidence_component
     )
 
-    risk_score = np.clip(
+    df["live_risk_score"] = np.clip(
         risk_score,
         0,
         100
-    )
-
-    df[
-        "live_risk_score"
-    ] = risk_score.round(2)
-
-    # ========================================================
-    # RISK CATEGORY
-    # ========================================================
+    ).round(2)
 
     def risk_category(score):
 
@@ -1111,73 +1231,94 @@ def run_v5_prediction(
 
         return "LOW"
 
-    df[
-        "live_risk_category"
-    ] = (
+    df["live_risk_category"] = (
         df[
             "live_risk_score"
-        ]
-        .apply(risk_category)
+        ].apply(
+            risk_category
+        )
     )
 
     return df
 
 
 # ============================================================
-# LOAD PREVIOUS RESULTS
+# SIDEBAR CONTROLS
 # ============================================================
 
-def load_previous_results():
-
-    if not os.path.exists(
-        LOCAL_PREDICTIONS_FILE
-    ):
-
-        return pd.DataFrame()
-
-    try:
-
-        df = pd.read_csv(
-            LOCAL_PREDICTIONS_FILE
-        )
-
-        return df
-
-    except Exception:
-
-        return pd.DataFrame()
-
-
-# ============================================================
-# HEADER
-# ============================================================
-
-st.title(
-    "🔥 ThermoWatch AI"
+st.sidebar.markdown(
+    "## ⚙️ THERMOWATCH CONTROLS"
 )
 
-st.subheader(
-    "LIVE Satellite Fire Detection & "
-    "Industrial Risk Intelligence"
+time_options = {
+    "24 Hours": 24,
+    "48 Hours": 48,
+    "72 Hours": 72,
+    "96 Hours": 96,
+    "7 Days": 168,
+    "Custom": None,
+}
+
+selected_window = st.sidebar.selectbox(
+    "Satellite observation window",
+    list(time_options.keys()),
+    index=0,
 )
 
-st.caption(
-    "NASA FIRMS → OSM Facilities → "
-    "V5 AI → Risk Assessment"
-)
+if selected_window == "Custom":
 
+    hours = st.sidebar.number_input(
+        "Hours",
+        min_value=1,
+        max_value=720,
+        value=24,
+        step=1,
+    )
 
-# ============================================================
-# SIDEBAR
-# ============================================================
+else:
 
-st.sidebar.header(
-    "ThermoWatch Controls"
-)
+    hours = time_options[
+        selected_window
+    ]
+
+st.sidebar.markdown("---")
 
 refresh = st.sidebar.button(
-    "🔄 Fetch Latest LIVE Data"
+    "🔄 FETCH LATEST LIVE DATA",
+    use_container_width=True,
 )
+
+st.sidebar.caption(
+    "NASA FIRMS observations are filtered "
+    "to the selected UTC time window."
+)
+
+st.sidebar.markdown("---")
+
+st.sidebar.markdown(
+    f"""
+**CURRENT WINDOW**
+
+`{hours} HOURS`
+
+**DATA SOURCE**
+
+NASA FIRMS VIIRS NOAA-20 NRT
+
+**GEOSPATIAL**
+
+OpenStreetMap
+
+**AI**
+
+V5 ExtraTrees Classifier
+"""
+)
+
+
+# ============================================================
+# SESSION CACHE INVALIDATION
+# ============================================================
 
 if refresh:
 
@@ -1185,17 +1326,16 @@ if refresh:
 
     st.rerun()
 
-st.sidebar.info(
-    "NASA FIRMS observations are filtered "
-    "to the latest 24-hour window."
-)
-
 
 # ============================================================
-# STEP 1 - MODEL
+# MAIN PIPELINE
 # ============================================================
 
 try:
+
+    # --------------------------------------------------------
+    # MODEL
+    # --------------------------------------------------------
 
     with st.spinner(
         "Loading V5 AI model..."
@@ -1203,40 +1343,33 @@ try:
 
         model = load_model()
 
-except Exception as e:
-
-    st.error(
-        "❌ Unable to load V5 AI model."
-    )
-
-    st.exception(e)
-
-    st.stop()
-
-
-# ============================================================
-# STEP 2 - OSM
-# ============================================================
-
-try:
+    # --------------------------------------------------------
+    # OSM
+    # --------------------------------------------------------
 
     with st.spinner(
-        "Loading OSM facility database..."
+        "Loading industrial facility database..."
     ):
 
-        facilities = (
-            load_osm_facilities()
+        facilities = load_osm_facilities()
+
+    # --------------------------------------------------------
+    # FIRMS
+    # --------------------------------------------------------
+
+    with st.spinner(
+        f"Fetching NASA FIRMS observations "
+        f"for last {hours} hours..."
+    ):
+
+        live = fetch_firms(
+            hours
         )
 
-    st.success(
-        f"OSM facilities loaded: "
-        f"{len(facilities):,}"
-    )
-
 except Exception as e:
 
     st.error(
-        "❌ Unable to load OSM facilities."
+        "ThermoWatch LIVE pipeline failed."
     )
 
     st.exception(e)
@@ -1245,264 +1378,924 @@ except Exception as e:
 
 
 # ============================================================
-# STEP 3 - LIVE FIRMS
-# ============================================================
-
-try:
-
-    with st.spinner(
-        "Fetching latest NASA FIRMS observations..."
-    ):
-
-        live = fetch_live_firms()
-
-except Exception as e:
-
-    st.error(
-        "❌ NASA FIRMS request failed."
-    )
-
-    st.exception(e)
-
-    st.stop()
-
-
-# ============================================================
-# IMPORTANT:
-# NO LIVE FIRE IS NOT AN ERROR
+# NO FIRE / NO OBSERVATION STATE
 # ============================================================
 
 if live.empty:
 
-    st.warning(
-        "🔥 No fire observations were detected "
-        "in the last 24 hours."
+    st.markdown(
+        f"""
+<div class="no-fire">
+
+<div class="no-fire-title">
+🛰️ NO THERMAL OBSERVATIONS DETECTED
+</div>
+
+<div class="no-fire-text">
+NASA FIRMS returned no satellite thermal observations
+inside the selected <b>{hours}-hour</b> window over India.
+</div>
+
+<div class="no-fire-text">
+This does <b>not</b> mean that fires can never occur;
+it means that no FIRMS observations passed the current
+time-window and India filters.
+</div>
+
+</div>
+""",
+        unsafe_allow_html=True,
     )
 
     st.info(
-        "This is a valid live-data state, "
-        "not an application failure."
+        "Use the sidebar to try 48 Hours, 72 Hours, "
+        "96 Hours or a custom window."
     )
+
+    st.markdown(
+        f"""
+<div class="notice">
+<b>Monitoring status:</b> ONLINE &nbsp;·&nbsp;
+<b>Window:</b> {hours} hours &nbsp;·&nbsp;
+<b>Satellite source:</b> VIIRS NOAA-20 NRT &nbsp;·&nbsp;
+<b>Observations:</b> 0
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        """
+### 🔍 What ThermoWatch is doing
+
+The application remains operational even when the
+selected window has no detected hotspots.
+
+The same dashboard can be used with a wider time window
+to inspect recent satellite observations.
+""",
+    )
+
+    st.stop()
+
+
+# ============================================================
+# FACILITY ATTRIBUTION
+# ============================================================
+
+with st.spinner(
+    "Matching thermal hotspots with nearest OSM facilities..."
+):
+
+    attributed = attribute_facilities(
+        live,
+        facilities
+    )
+
+
+# ============================================================
+# AI
+# ============================================================
+
+with st.spinner(
+    "Running V5 AI source classification and risk assessment..."
+):
+
+    predictions = run_v5_prediction(
+        attributed,
+        model
+    )
+
+
+# ============================================================
+# DISPLAY FACILITY NAME
+# ============================================================
+
+if "facility_name" not in predictions.columns:
+
+    predictions[
+        "facility_name"
+    ] = ""
+
+predictions[
+    "display_facility_name"
+] = predictions.apply(
+    lambda row:
+        clean_text(
+            row.get(
+                "facility_name",
+                ""
+            ),
+            ""
+        )
+        or
+        clean_text(
+            row.get(
+                "facility_operator",
+                ""
+            ),
+            ""
+        )
+        or
+        "Unidentified Facility",
+    axis=1,
+)
+
+
+# ============================================================
+# PIPELINE STATUS
+# ============================================================
+
+latest_observation = None
+
+if "observed_at" in predictions.columns:
+
+    parsed = pd.to_datetime(
+        predictions["observed_at"],
+        errors="coerce",
+        utc=True
+    )
+
+    if parsed.notna().any():
+
+        latest_observation = parsed.max()
+
+
+latest_text = (
+    format_observed(
+        latest_observation
+    )
+    if latest_observation is not None
+    else "Unavailable"
+)
+
+
+st.success(
+    f"LIVE PIPELINE COMPLETE · "
+    f"{len(predictions):,} satellite observations analyzed"
+)
+
+
+st.markdown(
+    f"""
+<div class="notice">
+<b>Observation window:</b> Last {hours} hours
+&nbsp; · &nbsp;
+<b>Latest satellite observation:</b> {latest_text}
+&nbsp; · &nbsp;
+<b>Source:</b> NASA FIRMS VIIRS NOAA-20 NRT
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+
+# ============================================================
+# METRICS
+# ============================================================
+
+total_hotspots = len(
+    predictions
+)
+
+high_count = int(
+    (
+        predictions[
+            "live_risk_category"
+        ]
+        == "HIGH"
+    ).sum()
+)
+
+critical_count = int(
+    (
+        predictions[
+            "live_risk_category"
+        ]
+        == "CRITICAL"
+    ).sum()
+)
+
+medium_count = int(
+    (
+        predictions[
+            "live_risk_category"
+        ]
+        == "MEDIUM"
+    ).sum()
+)
+
+avg_risk = safe_float(
+    predictions[
+        "live_risk_score"
+    ].mean()
+)
+
+max_risk = safe_float(
+    predictions[
+        "live_risk_score"
+    ].max()
+)
+
+
+c1, c2, c3, c4, c5 = st.columns(5)
+
+with c1:
 
     st.metric(
-        "LIVE Fires — Last 24 Hours",
-        "0"
+        "🔥 LIVE HOTSPOTS",
+        f"{total_hotspots:,}"
     )
 
-    st.divider()
+with c2:
 
-    st.subheader(
-        "📊 ThermoWatch Status"
+    st.metric(
+        "🚨 HIGH RISK",
+        high_count
     )
 
-    col1, col2, col3 = st.columns(3)
+with c3:
 
-    with col1:
+    st.metric(
+        "🔴 CRITICAL",
+        critical_count
+    )
 
-        st.success(
-            "✓ V5 AI Model Ready"
+with c4:
+
+    st.metric(
+        "⚠️ MEDIUM",
+        medium_count
+    )
+
+with c5:
+
+    st.metric(
+        "RISK AVG",
+        f"{avg_risk:.1f}"
+    )
+
+
+# ============================================================
+# FILTERS
+# ============================================================
+
+st.markdown(
+    '<div class="section-title">LIVE FILTERS</div>',
+    unsafe_allow_html=True
+)
+
+f1, f2, f3, f4 = st.columns(4)
+
+with f1:
+
+    risk_filter = st.multiselect(
+        "Risk",
+        [
+            "LOW",
+            "MEDIUM",
+            "HIGH",
+            "CRITICAL"
+        ],
+        default=[
+            "LOW",
+            "MEDIUM",
+            "HIGH",
+            "CRITICAL"
+        ],
+    )
+
+with f2:
+
+    source_values = sorted(
+        predictions[
+            "predicted_source"
+        ]
+        .fillna("UNKNOWN")
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+
+    source_filter = st.multiselect(
+        "AI Source",
+        source_values,
+        default=source_values,
+    )
+
+with f3:
+
+    proximity_values = sorted(
+        predictions[
+            "proximity_category"
+        ]
+        .fillna("FAR")
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+
+    proximity_filter = st.multiselect(
+        "Facility Proximity",
+        proximity_values,
+        default=proximity_values,
+    )
+
+with f4:
+
+    min_frp = st.number_input(
+        "Minimum FRP (MW)",
+        min_value=0.0,
+        max_value=float(
+            max(
+                1,
+                predictions[
+                    "frp"
+                ].max()
+            )
+        ),
+        value=0.0,
+        step=0.5,
+    )
+
+
+# ============================================================
+# APPLY FILTERS
+# ============================================================
+
+filtered = predictions.copy()
+
+filtered = filtered[
+    filtered[
+        "live_risk_category"
+    ].isin(
+        risk_filter
+    )
+]
+
+filtered = filtered[
+    filtered[
+        "predicted_source"
+    ]
+    .fillna("UNKNOWN")
+    .isin(
+        source_filter
+    )
+]
+
+filtered = filtered[
+    filtered[
+        "proximity_category"
+    ]
+    .fillna("FAR")
+    .isin(
+        proximity_filter
+    )
+]
+
+filtered = filtered[
+    filtered[
+        "frp"
+    ].fillna(0)
+    >= min_frp
+].copy()
+
+
+# ============================================================
+# LAYOUT
+# ============================================================
+
+left, center, right = st.columns(
+    [1.0, 2.2, 1.0],
+    gap="small"
+)
+
+
+# ============================================================
+# ALERT FEED
+# ============================================================
+
+with left:
+
+    st.markdown(
+        '<div class="section-title">⚡ ALERT FEED</div>'
+        '<div class="section-subtitle">'
+        'RANKED BY LIVE RISK SCORE'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    alert_df = (
+        filtered
+        .sort_values(
+            "live_risk_score",
+            ascending=False
         )
+        .head(12)
+    )
 
-    with col2:
+    if alert_df.empty:
 
-        st.success(
-            f"✓ OSM Facilities Ready "
-            f"({len(facilities):,})"
-        )
-
-    with col3:
-
-        st.success(
-            "✓ FIRMS Connected"
-        )
-
-    # --------------------------------------------------------
-    # Previous results
-    # --------------------------------------------------------
-
-    previous = load_previous_results()
-
-    if not previous.empty:
-
-        st.divider()
-
-        st.subheader(
-            "🕘 Previous ThermoWatch Results"
-        )
-
-        st.caption(
-            "No new fire was detected in the "
-            "last 24 hours. The table below is "
-            "historical/reference data and is "
-            "NOT being presented as current."
-        )
-
-        previous_display = previous.copy()
-
-        # Clearly label historical data
-        previous_display[
-            "data_status"
-        ] = "HISTORICAL / REFERENCE"
-
-        st.dataframe(
-            previous_display.head(20),
-            use_container_width=True,
-            hide_index=True
+        st.info(
+            "No hotspots match current filters."
         )
 
     else:
 
-        st.info(
-            "No previous ThermoWatch prediction "
-            "file is available."
+        for _, row in alert_df.iterrows():
+
+            risk = clean_text(
+                row[
+                    "live_risk_category"
+                ],
+                "LOW"
+            ).upper()
+
+            color = risk_color(
+                risk
+            )
+
+            facility = html.escape(
+                clean_text(
+                    row[
+                        "display_facility_name"
+                    ],
+                    "Unidentified Facility"
+                )
+            )
+
+            source = html.escape(
+                source_badge(
+                    row[
+                        "predicted_source"
+                    ]
+                )
+            )
+
+            hotspot = html.escape(
+                clean_text(
+                    row[
+                        "hotspot_id"
+                    ]
+                )
+            )
+
+            score = safe_float(
+                row[
+                    "live_risk_score"
+                ]
+            )
+
+            frp = safe_float(
+                row[
+                    "frp"
+                ]
+            )
+
+            st.markdown(
+                f"""
+<div class="alert-card">
+
+<div style="
+color:{color};
+font-family:monospace;
+font-weight:900;
+font-size:11px;
+">
+{risk} · {score:.1f}
+</div>
+
+<div class="alert-title">
+{facility}
+</div>
+
+<div style="
+color:#596b7e;
+font-family:monospace;
+font-size:9px;
+">
+{hotspot}
+</div>
+
+<div class="alert-meta">
+FRP {frp:.2f} MW · {source}
+</div>
+
+</div>
+""",
+                unsafe_allow_html=True,
+            )
+
+
+# ============================================================
+# INDIA THERMAL MAP
+# ============================================================
+
+with center:
+
+    st.markdown(
+        '<div class="section-title">'
+        '🇮🇳 INDIA THERMAL ACTIVITY MAP'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        f"""
+<div class="section-subtitle">
+{len(filtered):,} HOTSPOTS · THERMAL INTENSITY · AI RISK · FACILITY PROXIMITY
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    m = folium.Map(
+        location=[
+            22.5,
+            79.0
+        ],
+        zoom_start=5,
+        min_zoom=4,
+        max_zoom=12,
+        tiles="OpenStreetMap",
+        control_scale=True,
+    )
+
+    # --------------------------------------------------------
+    # Heatmap
+    # --------------------------------------------------------
+
+    heat_data = []
+
+    for row in filtered.itertuples():
+
+        lat = getattr(
+            row,
+            "latitude",
+            np.nan
         )
 
-    st.divider()
-
-    st.caption(
-        "ThermoWatch will automatically analyze "
-        "new FIRMS observations when they become "
-        "available."
-    )
-
-    st.stop()
-
-
-# ============================================================
-# LIVE DATA AVAILABLE
-# ============================================================
-
-st.success(
-    f"🔥 {len(live):,} LIVE fire observations "
-    "detected in the last 24 hours."
-)
-
-
-# ============================================================
-# STEP 4 - FACILITY ATTRIBUTION
-# ============================================================
-
-try:
-
-    with st.spinner(
-        "Matching live hotspots with nearest OSM facilities..."
-    ):
-
-        attributed = attribute_facilities(
-            live,
-            facilities
+        lon = getattr(
+            row,
+            "longitude",
+            np.nan
         )
 
-except Exception as e:
-
-    st.error(
-        "❌ Facility attribution failed."
-    )
-
-    st.exception(e)
-
-    st.stop()
-
-
-# ============================================================
-# STEP 5 - V5 AI
-# ============================================================
-
-try:
-
-    with st.spinner(
-        "Running V5 AI source classification and risk assessment..."
-    ):
-
-        predictions = run_v5_prediction(
-            attributed,
-            model
+        score = getattr(
+            row,
+            "live_risk_score",
+            0
         )
 
-except Exception as e:
+        if (
+            pd.notna(lat)
+            and pd.notna(lon)
+        ):
 
-    st.error(
-        "❌ V5 AI inference failed."
-    )
+            heat_data.append(
+                [
+                    float(lat),
+                    float(lon),
+                    max(
+                        float(score) / 100,
+                        0.05
+                    )
+                ]
+            )
 
-    st.exception(e)
+    if heat_data:
 
-    st.stop()
+        HeatMap(
+            heat_data,
+            name="🔥 Thermal Risk Zones",
+            radius=25,
+            blur=20,
+            min_opacity=0.30,
+            max_zoom=9,
+        ).add_to(m)
 
+    # --------------------------------------------------------
+    # Marker cluster
+    # --------------------------------------------------------
 
-if predictions.empty:
+    cluster = MarkerCluster(
+        name="Satellite Hotspots",
+        options={
+            "maxClusterRadius": 35,
+            "disableClusteringAtZoom": 8,
+        }
+    ).add_to(m)
 
-    st.warning(
-        "No predictions were generated."
-    )
+    # --------------------------------------------------------
+    # Markers
+    # --------------------------------------------------------
 
-    st.stop()
+    for _, row in filtered.iterrows():
 
+        lat = row[
+            "latitude"
+        ]
 
-# ============================================================
-# SUMMARY
-# ============================================================
+        lon = row[
+            "longitude"
+        ]
 
-st.success(
-    "✓ LIVE FIRMS → OSM → V5 AI pipeline completed."
-)
+        if (
+            pd.isna(lat)
+            or pd.isna(lon)
+        ):
 
+            continue
 
-col1, col2, col3, col4 = st.columns(4)
-
-
-with col1:
-
-    st.metric(
-        "LIVE Hotspots",
-        f"{len(predictions):,}"
-    )
-
-
-with col2:
-
-    high_count = int(
-        (
-            predictions[
+        risk = clean_text(
+            row[
                 "live_risk_category"
+            ],
+            "LOW"
+        ).upper()
+
+        color = risk_color(
+            risk
+        )
+
+        facility = html.escape(
+            clean_text(
+                row[
+                    "display_facility_name"
+                ],
+                "Unidentified Facility"
+            )
+        )
+
+        source = html.escape(
+            clean_text(
+                row[
+                    "predicted_source"
+                ],
+                "UNKNOWN"
+            )
+        )
+
+        hotspot = html.escape(
+            clean_text(
+                row[
+                    "hotspot_id"
+                ]
+            )
+        )
+
+        frp = safe_float(
+            row[
+                "frp"
             ]
-            == "HIGH"
-        ).sum()
-    )
+        )
 
-    st.metric(
-        "HIGH Risk",
-        high_count
-    )
-
-
-with col3:
-
-    critical_count = int(
-        (
-            predictions[
-                "live_risk_category"
-            ]
-            == "CRITICAL"
-        ).sum()
-    )
-
-    st.metric(
-        "CRITICAL",
-        critical_count
-    )
-
-
-with col4:
-
-    st.metric(
-        "Average Risk",
-        round(
-            predictions[
+        score = safe_float(
+            row[
                 "live_risk_score"
-            ].mean(),
-            2
+            ]
         )
+
+        confidence = safe_float(
+            row[
+                "confidence"
+            ]
+        )
+
+        distance = safe_float(
+            row[
+                "distance_to_facility_km"
+            ],
+            999
+        )
+
+        observed = html.escape(
+            format_observed(
+                row[
+                    "observed_at"
+                ]
+            )
+        )
+
+        popup_html = f"""
+<div style="
+font-family:Arial;
+min-width:270px;
+">
+
+<div style="
+font-size:16px;
+font-weight:800;
+margin-bottom:7px;
+">
+{facility}
+</div>
+
+<hr>
+
+<b>🔥 Hotspot</b><br>
+{hotspot}<br><br>
+
+<b>Risk</b><br>
+<span style="
+color:{color};
+font-weight:800;
+">
+{risk} · {score:.1f}/100
+</span>
+
+<br><br>
+
+<b>AI Source</b><br>
+{source}
+
+<br><br>
+
+<b>AI Confidence</b><br>
+{confidence:.1f}%
+
+<br><br>
+
+<b>FRP</b><br>
+{frp:.2f} MW
+
+<br><br>
+
+<b>Facility Distance</b><br>
+{distance:.3f} km
+
+<br><br>
+
+<b>Observed</b><br>
+{observed}
+
+</div>
+"""
+
+        folium.CircleMarker(
+            location=[
+                float(lat),
+                float(lon)
+            ],
+            radius=6
+            if risk == "LOW"
+            else 8
+            if risk == "MEDIUM"
+            else 10,
+            color=color,
+            fill=True,
+            fill_color=color,
+            fill_opacity=0.85,
+            weight=2,
+            popup=folium.Popup(
+                popup_html,
+                max_width=350
+            ),
+            tooltip=(
+                f"{risk} · "
+                f"Risk {score:.1f} · "
+                f"FRP {frp:.2f} MW"
+            ),
+        ).add_to(cluster)
+
+    # --------------------------------------------------------
+    # Map controls
+    # --------------------------------------------------------
+
+    folium.LayerControl(
+        collapsed=False
+    ).add_to(m)
+
+    st_folium(
+        m,
+        width=None,
+        height=650,
+        returned_objects=[],
+    )
+
+
+# ============================================================
+# RIGHT PANEL
+# ============================================================
+
+with right:
+
+    st.markdown(
+        '<div class="section-title">'
+        '🚨 HIGH PRIORITY'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    high_priority = (
+        filtered
+        .sort_values(
+            "live_risk_score",
+            ascending=False
+        )
+        .head(10)
+    )
+
+    if high_priority.empty:
+
+        st.info(
+            "No high-priority observations."
+        )
+
+    else:
+
+        for _, row in high_priority.iterrows():
+
+            risk = clean_text(
+                row[
+                    "live_risk_category"
+                ],
+                "LOW"
+            )
+
+            color = risk_color(
+                risk
+            )
+
+            facility = clean_text(
+                row[
+                    "display_facility_name"
+                ],
+                "Unidentified Facility"
+            )
+
+            score = safe_float(
+                row[
+                    "live_risk_score"
+                ]
+            )
+
+            frp = safe_float(
+                row[
+                    "frp"
+                ]
+            )
+
+            source = clean_text(
+                row[
+                    "predicted_source"
+                ],
+                "UNKNOWN"
+            )
+
+            st.markdown(
+                f"""
+<div class="alert-card">
+
+<div style="
+color:{color};
+font-family:monospace;
+font-weight:900;
+">
+{risk} · {score:.1f}
+</div>
+
+<div style="
+font-weight:800;
+margin-top:4px;
+">
+{html.escape(facility)}
+</div>
+
+<div class="alert-meta">
+FRP {frp:.2f} MW ·
+{html.escape(source)}
+</div>
+
+</div>
+""",
+                unsafe_allow_html=True
+            )
+
+
+# ============================================================
+# SOURCE DISTRIBUTION
+# ============================================================
+
+st.markdown(
+    '<div class="section-title">'
+    '🤖 AI SOURCE CLASSIFICATION'
+    '</div>',
+    unsafe_allow_html=True,
+)
+
+source_counts = (
+    filtered[
+        "predicted_source"
+    ]
+    .fillna("UNKNOWN")
+    .value_counts()
+)
+
+if not source_counts.empty:
+
+    st.bar_chart(
+        source_counts
     )
 
 
@@ -1510,88 +2303,48 @@ with col4:
 # RISK DISTRIBUTION
 # ============================================================
 
-st.header(
-    "📊 LIVE Risk Distribution"
+st.markdown(
+    '<div class="section-title">'
+    '⚠️ RISK DISTRIBUTION'
+    '</div>',
+    unsafe_allow_html=True,
 )
 
 risk_counts = (
-    predictions[
+    filtered[
         "live_risk_category"
     ]
     .value_counts()
 )
 
-st.bar_chart(
-    risk_counts
-)
+if not risk_counts.empty:
 
-
-# ============================================================
-# AI SOURCE DISTRIBUTION
-# ============================================================
-
-st.header(
-    "🤖 AI Source Classification"
-)
-
-source_counts = (
-    predictions[
-        "predicted_source"
-    ]
-    .value_counts()
-)
-
-st.bar_chart(
-    source_counts
-)
-
-
-# ============================================================
-# LIVE MAP
-# ============================================================
-
-st.header(
-    "🗺️ LIVE Fire Hotspots"
-)
-
-map_df = predictions[
-    [
-        "latitude",
-        "longitude"
-    ]
-].dropna()
-
-if not map_df.empty:
-
-    st.map(
-        map_df
-    )
-
-else:
-
-    st.info(
-        "No valid coordinates available."
+    st.bar_chart(
+        risk_counts
     )
 
 
 # ============================================================
-# HIGH RISK DETECTIONS
+# TOP DETECTIONS TABLE
 # ============================================================
 
-st.header(
-    "🚨 Highest Risk LIVE Detections"
+st.markdown(
+    '<div class="section-title">'
+    '📡 LIVE DETECTION TABLE'
+    '</div>',
+    unsafe_allow_html=True,
 )
 
 display_cols = [
 
     "hotspot_id",
 
-    "facility_name",
+    "display_facility_name",
 
     "latitude",
     "longitude",
 
-    "acquisition_datetime",
+    "observed_at",
 
     "frp",
 
@@ -1605,137 +2358,192 @@ display_cols = [
 
     "live_risk_score",
 
-    "live_risk_category"
+    "live_risk_category",
 ]
 
 display_cols = [
     c
     for c in display_cols
-    if c in predictions.columns
+    if c in filtered.columns
 ]
 
-top_risk = (
-    predictions
+table = (
+    filtered
     .sort_values(
         "live_risk_score",
         ascending=False
     )
-    [
-        display_cols
-    ]
-    .head(20)
+    [display_cols]
+    .head(100)
+    .copy()
 )
+
+table = table.rename(
+    columns={
+
+        "hotspot_id":
+            "Hotspot ID",
+
+        "display_facility_name":
+            "Facility",
+
+        "latitude":
+            "Latitude",
+
+        "longitude":
+            "Longitude",
+
+        "observed_at":
+            "Observed At",
+
+        "frp":
+            "FRP (MW)",
+
+        "predicted_source":
+            "AI Source",
+
+        "confidence":
+            "Confidence %",
+
+        "distance_to_facility_km":
+            "Facility Distance (km)",
+
+        "facility_match_quality":
+            "Attribution",
+
+        "live_risk_score":
+            "Risk Score",
+
+        "live_risk_category":
+            "Risk",
+    }
+)
+
+if "Observed At" in table.columns:
+
+    table["Observed At"] = (
+        table[
+            "Observed At"
+        ].apply(
+            format_observed
+        )
+    )
+
+if "Latitude" in table.columns:
+
+    table["Latitude"] = (
+        table["Latitude"].round(5)
+    )
+
+if "Longitude" in table.columns:
+
+    table["Longitude"] = (
+        table["Longitude"].round(5)
+    )
+
+if "FRP (MW)" in table.columns:
+
+    table["FRP (MW)"] = (
+        table["FRP (MW)"].round(2)
+    )
+
+if "Confidence %" in table.columns:
+
+    table["Confidence %"] = (
+        table["Confidence %"].round(1)
+    )
+
+if "Facility Distance (km)" in table.columns:
+
+    table[
+        "Facility Distance (km)"
+    ] = (
+        table[
+            "Facility Distance (km)"
+        ].round(3)
+    )
+
+if "Risk Score" in table.columns:
+
+    table["Risk Score"] = (
+        table["Risk Score"].round(2)
+    )
+
 
 st.dataframe(
-    top_risk,
+    table,
     use_container_width=True,
-    hide_index=True
+    height=450,
+    hide_index=True,
 )
 
 
 # ============================================================
-# FACILITY PROXIMITY
+# EXPORT
 # ============================================================
 
-st.header(
-    "🏭 Facility Proximity"
+st.markdown(
+    '<div class="section-title">'
+    '⬇️ EXPORT LIVE RESULTS'
+    '</div>',
+    unsafe_allow_html=True,
 )
 
-proximity_counts = (
-    predictions[
-        "proximity_category"
-    ]
-    .value_counts()
-)
-
-st.bar_chart(
-    proximity_counts
-)
-
-
-# ============================================================
-# LIVE DATA TABLE
-# ============================================================
-
-st.header(
-    "📡 LIVE FIRMS Observations"
-)
-
-live_display_cols = [
-
-    "hotspot_id",
-
-    "latitude",
-    "longitude",
-
-    "acquisition_datetime",
-
-    "frp",
-
-    "bright_ti4",
-
-    "satellite",
-
-    "confidence",
-
-    "facility_name",
-
-    "facility_type",
-
-    "distance_to_facility_km",
-
-    "predicted_source",
-
-    "live_risk_score",
-
-    "live_risk_category"
-]
-
-live_display_cols = [
-    c
-    for c in live_display_cols
-    if c in predictions.columns
-]
-
-st.dataframe(
-    predictions[
-        live_display_cols
-    ],
-    use_container_width=True,
-    hide_index=True
-)
-
-
-# ============================================================
-# DOWNLOAD
-# ============================================================
-
-st.header(
-    "⬇️ Export LIVE Results"
-)
-
-csv_data = predictions.to_csv(
-    index=False
-).encode(
-    "utf-8"
+csv_data = (
+    filtered
+    .to_csv(
+        index=False
+    )
+    .encode("utf-8")
 )
 
 st.download_button(
-    label="Download LIVE Predictions CSV",
+    label="⬇️ Download LIVE ThermoWatch CSV",
     data=csv_data,
-    file_name="thermowatch_live_predictions.csv",
-    mime="text/csv"
+    file_name=(
+        f"thermowatch_live_"
+        f"{hours}h.csv"
+    ),
+    mime="text/csv",
+    use_container_width=True,
 )
 
 
 # ============================================================
-# FOOTER
+# DATA PROVENANCE
 # ============================================================
 
-st.divider()
+st.markdown(
+    f"""
+<div class="footer">
 
-st.caption(
-    "ThermoWatch AI | "
-    "NASA FIRMS + OSM + V5 Machine Learning | "
-    "LIVE 24-Hour Fire Intelligence"
+THERMOWATCH AI · V5 MODEL · LIVE SATELLITE MONITORING
+
+&nbsp; | &nbsp;
+
+OBSERVATION WINDOW: {hours} HOURS
+
+&nbsp; | &nbsp;
+
+OBSERVATIONS: {len(predictions):,}
+
+&nbsp; | &nbsp;
+
+VISIBLE: {len(filtered):,}
+
+&nbsp; | &nbsp;
+
+LATEST OBSERVATION: {latest_text}
+
+&nbsp; | &nbsp;
+
+SOURCE: NASA FIRMS VIIRS NOAA-20 NRT
+
+&nbsp; | &nbsp;
+
+FACILITY CONTEXT: OPENSTREETMAP
+
+</div>
+""",
+    unsafe_allow_html=True,
 )
