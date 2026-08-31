@@ -9,4 +9,3 @@ shapely
 scikit-learn
 joblib
 reportlab
-html
