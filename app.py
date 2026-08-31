@@ -404,9 +404,17 @@ if predictions.empty:
     )
     
     # Clean fallback overview map
-    fallback_map = folium.Map(location=INDIA_CENTER, zoom_start=5, tiles="CartoDB dark_matter")
-    st_folium(fallback_map, width="100%", height=450)
-    st.stop()
+    # Purana line:
+# m_empty = folium.Map(location=INDIA_CENTER, zoom_start=5, tiles="OpenStreetMap")
+
+# Naya 100% Free Tile:
+m_empty = folium.Map(
+    location=INDIA_CENTER, 
+    zoom_start=5, 
+    tiles="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",
+    attr="&copy; OpenStreetMap contributors &copy; CARTO"
+)
+st_folium(m_empty, width="100%", height=450)
 
 # ============================================================
 # EXECUTIVE METRICS
