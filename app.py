@@ -80,8 +80,6 @@ INDIA_BBOX = "68.0,6.0,97.5,37.5"
 
 @st.cache_resource
 def load_model():
-
-```
 response = requests.get(
     HF_MODEL_URL,
     timeout=120
@@ -94,7 +92,6 @@ model = joblib.load(
 )
 
 return model
-```
 
 # ============================================================
 
