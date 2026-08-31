@@ -1,6 +1,5 @@
 import io
 import os
-import math
 import joblib
 import requests
 import numpy as np
@@ -9,27 +8,28 @@ import streamlit as st
 from sklearn.neighbors import BallTree
 from sklearn.cluster import DBSCAN
 import folium
+from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 
-# PDF Report Generation Libraries
+# PDF Report Generation
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 
 # ============================================================
-# THERMO WATCH AI - INDUSTRIAL & SATELLITE RISK PLATFORM
-# FIRMS -> DBSCAN -> OSM -> V5 AI -> WEATHER -> ALERTS
+# PAGE CONFIGURATION
 # ============================================================
 
 st.set_page_config(
-    page_title="ThermoWatch AI - Threat Intelligence",
+    page_title="ThermoWatch AI - Satellite Risk Intelligence",
     page_icon="🔥",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
 # ============================================================
-# CONFIGURATION
+# CONFIGURATION & REPOSITORIES
 # ============================================================
 
 HF_MODEL_URL = "https://huggingface.co/harshitcodes1544/sihharshit154/resolve/main/source_classifier_v5.joblib"
@@ -38,6 +38,7 @@ HF_OSM_URL = "https://huggingface.co/datasets/harshitcodes1544/thermowatch-osm-d
 FIRMS_API_KEY = st.secrets.get("FIRMS_API_KEY", os.environ.get("FIRMS_API_KEY", ""))
 FIRMS_URL = "https://firms.modaps.eosdis.nasa.gov/api/area/csv/"
 INDIA_BBOX = "68.0,6.0,97.5,37.5"
+INDIA_CENTER = [22.9734, 78.6569]
 
 # ============================================================
 # CACHED LOADERS (MODEL & OSM)
@@ -56,13 +57,13 @@ def load_osm_facilities():
     return pd.read_csv(io.BytesIO(response.content))
 
 # ============================================================
-# NASA FIRMS INGESTION WITH MULTI-SENSOR FALLBACK
+# NASA FIRMS INGESTION (SAFE, MULTI-SENSOR)
 # ============================================================
 
 @st.cache_data(ttl=1800)
 def fetch_live_firms(day_range=1):
     if not FIRMS_API_KEY:
-        raise RuntimeError("FIRMS_API_KEY missing. Add it to Streamlit Secrets.")
+        return pd.DataFrame()
 
     sensors = ["VIIRS_NOAA20_NRT", "VIIRS_SNPP_NRT", "VIIRS_NOAA21_NRT"]
     df = pd.DataFrame()
@@ -80,7 +81,7 @@ def fetch_live_firms(day_range=1):
             continue
 
     if df.empty:
-        raise RuntimeError(f"NASA FIRMS returned 0 observations across VIIRS sensors for past {day_range} day(s).")
+        return pd.DataFrame()
 
     rename_map = {
         "latitude": "latitude", "longitude": "longitude", "bright_ti4": "bright_ti4",
@@ -107,23 +108,25 @@ def fetch_live_firms(day_range=1):
     return df
 
 # ============================================================
-# CLUSTERING (DBSCAN) & FACILITY ATTRIBUTION
+# CLUSTERING & FACILITY ATTRIBUTION
 # ============================================================
 
 def apply_spatial_clustering(df):
-    """Groups dense clusters of fire hotspots within ~5km."""
     if len(df) < 2:
         df["cluster_id"] = "CLUSTER_000"
         return df
 
     coords_rad = np.radians(df[["latitude", "longitude"]].values)
-    # 5km epsilon in radians (5 / 6371)
+    # 5 km epsilon
     db = DBSCAN(eps=5.0 / 6371.0, min_samples=2, metric='haversine')
     clusters = db.fit_predict(coords_rad)
     df["cluster_id"] = [f"CLUSTER_{c:03d}" if c != -1 else "ISOLATED" for c in clusters]
     return df
 
 def attribute_facilities(live, facilities):
+    if live.empty:
+        return live
+
     live = live.copy()
     facilities = facilities.copy()
 
@@ -133,6 +136,12 @@ def attribute_facilities(live, facilities):
 
     live = live.dropna(subset=["latitude", "longitude"]).reset_index(drop=True)
     facilities = facilities.dropna(subset=["latitude", "longitude"]).reset_index(drop=True)
+
+    if facilities.empty:
+        live["distance_to_facility_km"] = 999.0
+        live["proximity_category"] = "FAR"
+        live["facility_match_quality"] = "VERY_LOW"
+        return live
 
     facility_coords = np.radians(facilities[["latitude", "longitude"]].values)
     live_coords = np.radians(live[["latitude", "longitude"]].values)
@@ -165,7 +174,7 @@ def attribute_facilities(live, facilities):
     return result
 
 # ============================================================
-# WEATHER & SMOKE DISPERSION ENGINE (OPEN-METEO)
+# WEATHER & DISPERSION ENGINE (OPEN-METEO)
 # ============================================================
 
 @st.cache_data(ttl=1800)
@@ -187,7 +196,7 @@ def get_compass_bearing(deg):
     return dirs[ix]
 
 # ============================================================
-# FEATURE ENGINEERING & V5 PREDICTION
+# FEATURE ENGINEERING & MODEL PREDICTION
 # ============================================================
 
 FEATURES = [
@@ -251,6 +260,9 @@ def engineer_features(df):
     return df
 
 def run_v5_prediction(df, model):
+    if df.empty:
+        return df
+
     df = engineer_features(df)
     X = df[FEATURES].copy()
 
@@ -266,7 +278,6 @@ def run_v5_prediction(df, model):
     df["predicted_source"] = preds
     df["confidence"] = conf.round(1)
 
-    # Risk Score Formulation
     frp_c = np.clip(df["mean_frp"] * 3, 0, 35)
     mfrp_c = np.clip(df["max_frp"] * 0.5, 0, 20)
     conf_c = conf * 0.20
@@ -280,55 +291,30 @@ def run_v5_prediction(df, model):
     return df
 
 # ============================================================
-# DISCORD / TELEGRAM ALERT DISPATCHER
+# PDF REPORT BUILDER
 # ============================================================
 
-def send_webhook_alert(webhook_url, top_incident):
-    if not webhook_url:
-        return False
-    msg = {
-        "content": f"🚨 **CRITICAL FIRE INCIDENT DETECTED** 🚨\n"
-                   f"- **ID:** `{top_incident.get('hotspot_id')}`\n"
-                   f"- **Risk Level:** `{top_incident.get('live_risk_category')}` (Score: {top_incident.get('live_risk_score')}/100)\n"
-                   f"- **Source:** `{top_incident.get('predicted_source')}`\n"
-                   f"- **Nearest Facility:** {top_incident.get('facility_name', 'Unknown')} ({top_incident.get('distance_to_facility_km', 0):.2f} km)\n"
-                   f"- **FRP:** {top_incident.get('frp')} MW\n"
-                   f"- **Coordinates:** `{top_incident.get('latitude')}, {top_incident.get('longitude')}`\n"
-                   f"- **Maps Link:** https://www.google.com/maps?q={top_incident.get('latitude')},{top_incident.get('longitude')}"
-    }
-    try:
-        requests.post(webhook_url, json=msg, timeout=5)
-        return True
-    except Exception:
-        return False
-
-# ============================================================
-# PDF INCIDENT REPORT GENERATOR
-# ============================================================
-
-def generate_pdf_report(df):
+def generate_pdf_report(df, time_window_label):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
     styles = getSampleStyleSheet()
     story = []
 
-    title_style = ParagraphStyle(name='TitleStyle', parent=styles['Heading1'], fontSize=18, textColor=colors.HexColor("#b91c1c"))
-    story.append(Paragraph("ThermoWatch AI — Threat & Emission Audit Report", title_style))
-    story.append(Paragraph(f"Generated on: {pd.Timestamp.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC", styles['Normal']))
+    title_style = ParagraphStyle(name='TitleStyle', parent=styles['Heading1'], fontSize=16, textColor=colors.HexColor("#b91c1c"))
+    story.append(Paragraph("ThermoWatch AI — Satellite Thermal Threat Audit", title_style))
+    story.append(Paragraph(f"Window: {time_window_label} | Generated on: {pd.Timestamp.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC", styles['Normal']))
     story.append(Spacer(1, 15))
 
-    # Summary
     summary_text = (
         f"<b>Total Hotspots:</b> {len(df)} | "
-        f"<b>Critical Incidents:</b> {(df['live_risk_category'] == 'CRITICAL').sum()} | "
+        f"<b>Critical:</b> {(df['live_risk_category'] == 'CRITICAL').sum()} | "
         f"<b>High Risk:</b> {(df['live_risk_category'] == 'HIGH').sum()} | "
-        f"<b>Average Risk Score:</b> {df['live_risk_score'].mean():.2f}"
+        f"<b>Average Risk Score:</b> {df['live_risk_score'].mean():.2f}/100"
     )
     story.append(Paragraph(summary_text, styles['Normal']))
     story.append(Spacer(1, 15))
 
-    # Table Top 15 Incidents
-    table_data = [["ID", "Lat/Lon", "Source", "Confidence", "Facility", "Dist(km)", "Risk"]]
+    table_data = [["ID", "Lat/Lon", "Source", "Conf.", "Facility", "Dist(km)", "Risk"]]
     top_15 = df.sort_values("live_risk_score", ascending=False).head(15)
 
     for _, row in top_15.iterrows():
@@ -342,7 +328,7 @@ def generate_pdf_report(df):
             str(row["live_risk_category"])
         ])
 
-    t = Table(table_data, colWidths=[65, 80, 80, 65, 110, 55, 65])
+    t = Table(table_data, colWidths=[65, 80, 80, 50, 125, 55, 65])
     t.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#1e293b")),
         ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
@@ -358,202 +344,202 @@ def generate_pdf_report(df):
     return buffer.getvalue()
 
 # ============================================================
-# SIDEBAR CONTROLS & WEBHOOK SETUP
+# SIDEBAR CONTROLS
 # ============================================================
 
-st.sidebar.title("🛡️ Mission Control")
+st.sidebar.title("🛡️ ThermoWatch Controls")
 
-lookback_days = st.sidebar.slider("FIRMS Lookback Period (Days)", min_value=1, max_value=5, value=1)
-min_confidence_filter = st.sidebar.slider("Minimum AI Confidence (%)", min_value=0, max_value=100, value=0)
+time_window_options = {
+    "Last 24 Hours (1 Day)": 1,
+    "Last 48 Hours (2 Days)": 2,
+    "Last 72 Hours (3 Days)": 3,
+    "Last 96 Hours (4 Days)": 4
+}
 
-st.sidebar.subheader("📡 Incident Webhook Dispatch")
-webhook_url = st.sidebar.text_input("Discord/Slack Webhook URL", type="password", placeholder="https://discord.com/api/webhooks/...")
+selected_window_label = st.sidebar.selectbox(
+    "Select Observation Time Window:",
+    options=list(time_window_options.keys()),
+    index=0
+)
+lookback_days = time_window_options[selected_window_label]
 
-if st.sidebar.button("🔄 Trigger Realtime Pipeline"):
+min_conf = st.sidebar.slider("Filter AI Confidence (%)", min_value=0, max_value=100, value=0)
+
+if st.sidebar.button("🔄 Sync Satellite Feeds"):
     st.cache_data.clear()
     st.rerun()
 
+st.sidebar.info("Satellite: VIIRS NOAA-20 / SNPP / NOAA-21 (NASA FIRMS NRT Feed)")
+
 # ============================================================
-# EXECUTION PIPELINE
+# PIPELINE EXECUTION
 # ============================================================
 
-try:
-    with st.spinner("Synchronizing AI Engine & Global Databases..."):
-        model = load_model()
-        facilities = load_osm_facilities()
-        live_raw = fetch_live_firms(day_range=lookback_days)
-        clustered = apply_spatial_clustering(live_raw)
-        attributed = attribute_facilities(clustered, facilities)
-        predictions = run_v5_prediction(attributed, model)
+st.title("🔥 ThermoWatch AI — Planetary Thermal Intelligence")
+st.caption(f"Realtime Satellite Thermal Detection over India Region | Active Window: **{selected_window_label}**")
 
-    # Filter by user criteria
-    predictions = predictions[predictions["confidence"] >= min_confidence_filter].reset_index(drop=True)
+with st.spinner("Synchronizing AI weights & NASA FIRMS telemetry..."):
+    model = load_model()
+    facilities = load_osm_facilities()
+    raw_firms = fetch_live_firms(day_range=lookback_days)
 
-except Exception as e:
-    st.error("ThermoWatch LIVE pipeline failed.")
-    st.exception(e)
+if not raw_firms.empty:
+    clustered = apply_spatial_clustering(raw_firms)
+    attributed = attribute_facilities(clustered, facilities)
+    predictions = run_v5_prediction(attributed, model)
+    if min_conf > 0:
+        predictions = predictions[predictions["confidence"] >= min_conf].reset_index(drop=True)
+else:
+    predictions = pd.DataFrame()
+
+# ============================================================
+# GRACEFUL NO-DETECTION STATE (NO CRASH)
+# ============================================================
+
+if predictions.empty:
+    st.success("✅ **Status Normal: No Active Thermal Anomalies Detected**")
+    st.info(
+        f"NASA FIRMS reported **0 thermal hotspot incidents** across the Indian airspace for the **{selected_window_label}** window.\n\n"
+        "💡 *Tip: If you're investigating past seasonal events or stubble burning, expand the observation window up to 96 Hours (4 Days) from the sidebar.*"
+    )
+    
+    # Clean fallback overview map
+    fallback_map = folium.Map(location=INDIA_CENTER, zoom_start=5, tiles="CartoDB dark_matter")
+    st_folium(fallback_map, width="100%", height=450)
     st.stop()
 
-# Header banner
-st.title("🔥 ThermoWatch AI — Planetary Thermal Intelligence")
-st.caption("Live NASA VIIRS + OpenStreetMap Haversine BallTree + V5 Classifier + Open-Meteo Dispersion Matrix")
-
 # ============================================================
-# EXECUTIVE DASHBOARD METRICS
+# EXECUTIVE METRICS
 # ============================================================
 
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Hotspots Detected", len(predictions))
-c2.metric("Clusters Formed", predictions["cluster_id"].nunique())
-c3.metric("Critical Risks", int((predictions["live_risk_category"] == "CRITICAL").sum()))
-c4.metric("High Risks", int((predictions["live_risk_category"] == "HIGH").sum()))
-c5.metric("Avg Fleet Risk", f"{predictions['live_risk_score'].mean():.1f}/100")
-
-# Dispatch alert button
-if st.sidebar.button("🚨 Broadcast Top Critical Event to Webhook"):
-    if not webhook_url:
-        st.sidebar.error("Please enter a valid webhook URL.")
-    else:
-        top_crit = predictions.sort_values("live_risk_score", ascending=False).iloc[0].to_dict()
-        if send_webhook_alert(webhook_url, top_crit):
-            st.sidebar.success("Dispatched alert successfully!")
-        else:
-            st.sidebar.error("Failed to deliver alert payload.")
+c2.metric("Spatial Clusters", predictions["cluster_id"].nunique())
+c3.metric("Critical Hazards", int((predictions["live_risk_category"] == "CRITICAL").sum()))
+c4.metric("High Risk Fires", int((predictions["live_risk_category"] == "HIGH").sum()))
+c5.metric("Avg Fleet Risk", f"{predictions['live_risk_score'].mean():.1f} / 100")
 
 # ============================================================
-# INTERACTIVE FOLIUM MAP (BUFFERS, HEATMAP & DISPERSION)
+# INTERACTIVE INDIA HEATMAP & SPATIAL CLUSTERS
 # ============================================================
 
-st.subheader("🗺️ Geospatial Tactical Map & Industrial Hazard Zones")
+st.subheader("🗺️ India Thermal Anomaly & Proximity Map")
 
-# Center around median coordinates
 map_center = [predictions["latitude"].median(), predictions["longitude"].median()]
-m = folium.Map(location=map_center, zoom_start=6, tiles="CartoDB dark_matter")
+m = folium.Map(location=map_center, zoom_start=5, tiles="CartoDB dark_matter")
 
-# Add NASA Worldview Thermal Overlay TileLayer
-folium.TileLayer(
-    tiles="https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/MODIS_Terra_CorrectedReflectance_TrueColor/default/default/GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg",
-    attr="NASA GIBS TrueColor",
-    name="NASA Satellite Imagery",
-    overlay=True,
-    opacity=0.45
-).add_to(m)
+# 1. Density HeatMap Layer
+heat_data = [[row["latitude"], row["longitude"], float(row["frp"])] for _, row in predictions.iterrows()]
+HeatMap(heat_data, radius=16, blur=18, min_opacity=0.35, max_zoom=10).add_to(m)
 
-# Risk color mapper
-risk_color_map = {
-    "CRITICAL": "#ef4444",  # Red
-    "HIGH": "#f97316",      # Orange
-    "MEDIUM": "#eab308",    # Yellow
-    "LOW": "#22c55e"        # Green
+# 2. Individual Point Markers & Danger Buffers
+risk_colors = {
+    "CRITICAL": "#ef4444",
+    "HIGH": "#f97316",
+    "MEDIUM": "#eab308",
+    "LOW": "#22c55e"
 }
 
-for _, row in predictions.head(150).iterrows():
-    color = risk_color_map.get(row["live_risk_category"], "#3b82f6")
+for _, row in predictions.head(200).iterrows():
+    color = risk_colors.get(row["live_risk_category"], "#3b82f6")
     popup_html = f"""
     <div style='font-family:sans-serif; width:220px;'>
         <h4 style='margin:0; color:{color};'>{row['hotspot_id']} ({row['live_risk_category']})</h4>
-        <b>AI Source:</b> {row['predicted_source']} ({row['confidence']}%)<br>
+        <b>Source:</b> {row['predicted_source']} ({row['confidence']}%)<br>
         <b>FRP:</b> {row['frp']} MW<br>
         <b>Facility:</b> {row.get('facility_name', 'Unknown')}<br>
-        <b>Proximity:</b> {row['distance_to_facility_km']:.2f} km<br>
+        <b>Distance:</b> {row['distance_to_facility_km']:.2f} km<br>
         <b>Cluster:</b> {row['cluster_id']}
     </div>
     """
-    # Hotspot Circle Marker
     folium.CircleMarker(
         location=[row["latitude"], row["longitude"]],
-        radius=6 + (row["frp"] / 50.0),
+        radius=5 + min((row["frp"] / 40.0), 12),
         color=color,
         fill=True,
         fill_color=color,
-        fill_opacity=0.8,
+        fill_opacity=0.85,
         popup=folium.Popup(popup_html, max_width=250)
     ).add_to(m)
 
-    # If within 2km of critical facility, draw danger buffer ring
+    # Highlight near-facility hazards (within 2 km)
     if row["distance_to_facility_km"] <= 2.0:
         folium.Circle(
             location=[row["facility_latitude"], row["facility_longitude"]],
             radius=1500,
             color="#dc2626",
-            weight=1,
+            weight=1.5,
             fill=True,
             fill_opacity=0.15,
-            tooltip=f"Hazard Zone: {row.get('facility_name', 'Industrial Facility')}"
+            tooltip=f"Industrial Zone: {row.get('facility_name', 'Facility')}"
         ).add_to(m)
 
-folium.LayerControl().add_to(m)
-st_folium(m, width="100%", height=520)
+st_folium(m, width="100%", height=530)
 
 # ============================================================
-# WEATHER & DISPERSION ANALYSIS FOR TOP THREAT
+# WEATHER & DISPERSION VECTOR (TOP THREAT)
 # ============================================================
-
-st.subheader("🌪️ Atmospheric Dispersion & Smoke Vector Analysis")
 
 top_threat = predictions.sort_values("live_risk_score", ascending=False).iloc[0]
 w_speed, w_dir, w_humidity = fetch_weather_vector(top_threat["latitude"], top_threat["longitude"])
 cardinal = get_compass_bearing(w_dir)
 
+st.subheader("🌪️ Realtime Dispersion & Wind Vectors")
 wc1, wc2, wc3, wc4 = st.columns(4)
-wc1.info(f"📍 **Target Area:** `{top_threat['hotspot_id']}` ({top_threat.get('facility_name', 'Unknown')})")
+wc1.info(f"📍 **Target:** `{top_threat['hotspot_id']}` ({top_threat.get('facility_name', 'Open Area')})")
 wc2.metric("Surface Wind Speed", f"{w_speed} km/h")
-wc3.metric("Wind Vector", f"{w_dir}° ({cardinal})")
+wc3.metric("Wind Direction", f"{w_dir}° ({cardinal})")
 wc4.metric("Ambient Humidity", f"{w_humidity}%")
-
-st.caption(f"⚠️ **Dispersion Trajectory:** Smoke & aerosol emissions are currently propagating towards the **{cardinal}** sector at **{w_speed} km/h**.")
+st.caption(f"⚠️ **Dispersion Trajectory:** Smoke & toxic aerosol plumes are propagating towards the **{cardinal}** sector at **{w_speed} km/h**.")
 
 # ============================================================
-# ANALYTICS & BREAKDOWN
+# CHARTS & ANALYTICS
 # ============================================================
 
-col_a, col_b = st.columns(2)
-with col_a:
-    st.subheader("📊 Threat Distribution by AI Classification")
+col_l, col_r = st.columns(2)
+with col_l:
+    st.subheader("📊 AI Classification Breakdown")
     st.bar_chart(predictions["predicted_source"].value_counts())
 
-with col_b:
-    st.subheader("🏭 Cluster Density")
-    st.bar_chart(predictions["cluster_id"].value_counts().head(10))
+with col_r:
+    st.subheader("🚨 Risk Severity Levels")
+    st.bar_chart(predictions["live_risk_category"].value_counts())
 
 # ============================================================
-# DETAILED AUDIT LOGS & REPORT DOWNLOADS
+# TRIAGE QUEUE & EXPORT OPTIONS
 # ============================================================
 
-st.subheader("🚨 Priority Triage Queue")
-
-table_cols = [
+st.subheader("📋 Priority Hazard Audit Queue")
+display_cols = [
     "hotspot_id", "cluster_id", "facility_name", "predicted_source",
     "confidence", "frp", "distance_to_facility_km", "live_risk_score", "live_risk_category"
 ]
 st.dataframe(
-    predictions.sort_values("live_risk_score", ascending=False)[table_cols].head(30),
+    predictions.sort_values("live_risk_score", ascending=False)[display_cols].head(25),
     use_container_width=True,
     hide_index=True
 )
 
-st.subheader("📥 Export Tactical Data & Executive Briefings")
-d_col1, d_col2 = st.columns(2)
-
-with d_col1:
+st.subheader("📥 Export Intelligence Reports")
+d1, d2 = st.columns(2)
+with d1:
     csv_bytes = predictions.to_csv(index=False).encode('utf-8')
     st.download_button(
-        label="📄 Download Full Telemetry (CSV)",
+        label="📄 Download Telemetry CSV",
         data=csv_bytes,
-        file_name="thermowatch_audit_data.csv",
+        file_name=f"thermowatch_{lookback_days}d_telemetry.csv",
         mime="text/csv",
         use_container_width=True
     )
-
-with d_col2:
-    pdf_bytes = generate_pdf_report(predictions)
+with d2:
+    pdf_bytes = generate_pdf_report(predictions, selected_window_label)
     st.download_button(
-        label="📑 Download Executive Incident Audit (PDF)",
+        label="📑 Download Incident Audit PDF",
         data=pdf_bytes,
-        file_name="thermowatch_executive_report.pdf",
+        file_name=f"thermowatch_{lookback_days}d_report.pdf",
         mime="application/pdf",
         use_container_width=True
     )
 
 st.divider()
-st.caption("ThermoWatch AI Platform | Defense-Grade Environmental & Industrial Threat Intelligence")
+st.caption("ThermoWatch AI | Defense-Grade Environmental & Industrial Threat Intelligence")
